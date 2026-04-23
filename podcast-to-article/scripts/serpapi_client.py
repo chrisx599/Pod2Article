@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-if __package__ in {None, ""}:
-    from oxylabs_client import CandidateProbe, OxylabsError
-else:
-    from .oxylabs_client import CandidateProbe, OxylabsError
+
+@dataclass
+class CandidateProbe:
+    metadata: dict[str, Any]
+    content_payload: dict[str, Any]
+    source_kind: str
+    origin: str
 
 
-class SerpApiError(OxylabsError):
+class SerpApiError(RuntimeError):
     """Raised when SerpApi returns an unrecoverable error."""
 
 
@@ -45,8 +49,7 @@ class SerpApiClient:
             raise SerpApiError(f"SerpApi error: {payload['error']}")
         return payload
 
-    def search(self, query: str, source: str = "youtube_search", subtitles: bool = True) -> dict[str, Any]:
-        del source, subtitles
+    def search(self, query: str) -> dict[str, Any]:
         return self._request({"engine": "youtube", "search_query": query})
 
     def metadata(self, video_id: str) -> dict[str, Any]:

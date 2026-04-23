@@ -203,12 +203,12 @@ def normalize_timed_content(
 
     results = payload.get("results", [])
     if not results:
-        raise ValueError("No Oxylabs or SerpApi results were returned.")
+        raise ValueError("No timed-content results were returned.")
 
     first = results[0]
     content = first.get("content")
     if content is None:
-        raise ValueError("Oxylabs result is missing content.")
+        raise ValueError("Timed-content result is missing content.")
 
     if isinstance(content, dict):
         raw_subtitle_segments = _normalize_raw_subtitle_events(

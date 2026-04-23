@@ -5,5 +5,3 @@
 # 3. local .env
 
 SERPAPI_API_KEY=your-serpapi-api-key
-OXYLABS_USERNAME=your-oxylabs-username
-OXYLABS_PASSWORD=your-oxylabs-password

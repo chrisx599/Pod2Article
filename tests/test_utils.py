@@ -16,7 +16,6 @@ from utils import (  # noqa: E402
     extract_video_id,
     format_timestamp,
     load_local_env,
-    parse_credentials,
     parse_serpapi_key,
     resolve_setting,
     slugify,
@@ -45,22 +44,17 @@ class UtilsTestCase(unittest.TestCase):
     def test_load_local_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             env_path = Path(tmpdir) / ".env"
-            env_path.write_text("OXYLABS_USERNAME=test-user\nOXYLABS_PASSWORD=test-pass\n", encoding="utf-8")
-            old_user = os.environ.pop("OXYLABS_USERNAME", None)
-            old_pass = os.environ.pop("OXYLABS_PASSWORD", None)
+            env_path.write_text("SERPAPI_API_KEY=test-key\n", encoding="utf-8")
+            old_key = os.environ.pop("SERPAPI_API_KEY", None)
             try:
                 loaded = load_local_env(Path(tmpdir))
-                self.assertEqual(loaded["OXYLABS_USERNAME"], "test-user")
-                self.assertEqual(os.environ["OXYLABS_PASSWORD"], "test-pass")
+                self.assertEqual(loaded["SERPAPI_API_KEY"], "test-key")
+                self.assertEqual(os.environ["SERPAPI_API_KEY"], "test-key")
             finally:
-                if old_user is not None:
-                    os.environ["OXYLABS_USERNAME"] = old_user
+                if old_key is not None:
+                    os.environ["SERPAPI_API_KEY"] = old_key
                 else:
-                    os.environ.pop("OXYLABS_USERNAME", None)
-                if old_pass is not None:
-                    os.environ["OXYLABS_PASSWORD"] = old_pass
-                else:
-                    os.environ.pop("OXYLABS_PASSWORD", None)
+                    os.environ.pop("SERPAPI_API_KEY", None)
 
     def test_resolve_setting_prefers_config_over_environment_and_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -91,23 +85,6 @@ class UtilsTestCase(unittest.TestCase):
                     os.environ.pop("SERPAPI_API_KEY", None)
                 else:
                     os.environ["SERPAPI_API_KEY"] = old_key
-
-    def test_parse_credentials_reads_config_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            (root / ".pod2article.config").write_text(
-                "OXYLABS_USERNAME=config-user\nOXYLABS_PASSWORD=config-pass\n",
-                encoding="utf-8",
-            )
-            old_user = os.environ.pop("OXYLABS_USERNAME", None)
-            old_pass = os.environ.pop("OXYLABS_PASSWORD", None)
-            try:
-                self.assertEqual(parse_credentials(root), ("config-user", "config-pass"))
-            finally:
-                if old_user is not None:
-                    os.environ["OXYLABS_USERNAME"] = old_user
-                if old_pass is not None:
-                    os.environ["OXYLABS_PASSWORD"] = old_pass
 
 
 if __name__ == "__main__":

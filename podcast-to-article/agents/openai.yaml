@@ -1,8 +1,7 @@
 interface:
   display_name: "Podcast to Article"
-  short_description: "Convert YouTube podcasts into linked Markdown articles"
-  default_prompt: "Use $podcast-to-article to turn a YouTube podcast into a Markdown article with clickable timestamps."
+  short_description: "Fetch YouTube search results and transcript context for linked articles"
+  default_prompt: "Use $podcast-to-article to fetch YouTube transcript context, then write the article with clickable timestamps."
 
 policy:
   allow_implicit_invocation: true
-

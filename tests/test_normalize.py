@@ -9,7 +9,7 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1] / "podcast-to-article" / "scrip
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from normalize import merge_timed_segments, normalize_timed_content  # noqa: E402
+from normalize import Segment, merge_timed_segments, normalize_timed_content  # noqa: E402
 
 
 class NormalizeTestCase(unittest.TestCase):
@@ -31,14 +31,6 @@ class NormalizeTestCase(unittest.TestCase):
         self.assertEqual(len(segments), 2)
         self.assertEqual(segments[1].start_sec, 7)
 
-    def test_normalize_raw_subtitles_payload(self) -> None:
-        payload = self._fixture("raw_subtitles_payload.json")
-        segments = normalize_timed_content(payload, video_id="abc123def45", source_kind="subtitles", language="en")
-        self.assertEqual(len(segments), 2)
-        self.assertEqual(segments[0].start_sec, 0)
-        self.assertEqual(segments[0].end_sec, 3)
-        self.assertIn("realistic subtitle event", segments[0].text)
-
     def test_normalize_prefers_accessibility_label_when_available(self) -> None:
         payload = self._fixture("transcript_accessibility_payload.json")
         segments = normalize_timed_content(payload, video_id="abc123def45", source_kind="transcript", language="en")
@@ -56,11 +48,13 @@ class NormalizeTestCase(unittest.TestCase):
         self.assertEqual(segments[1].label, "GPT-5 demo")
 
     def test_merge_timed_segments_combines_short_adjacent_segments(self) -> None:
-        payload = self._fixture("raw_subtitles_payload.json")
-        segments = normalize_timed_content(payload, video_id="abc123def45", source_kind="subtitles", language="en")
+        segments = [
+            Segment(0, 3, "This is a short segment.", "transcript", "en", "abc123def45"),
+            Segment(3, 7, "Another adjacent line follows.", "transcript", "en", "abc123def45"),
+        ]
         merged = merge_timed_segments(segments)
         self.assertEqual(len(merged), 1)
-        self.assertIn("This is a realistic subtitle event. Another subtitle line follows.", merged[0].text)
+        self.assertIn("This is a short segment. Another adjacent line follows.", merged[0].text)
 
 
 if __name__ == "__main__":

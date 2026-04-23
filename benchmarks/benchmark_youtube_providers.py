@@ -20,11 +20,10 @@ SCRIPT_DIR = REPO_ROOT / "podcast-to-article" / "scripts"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from build_article import parse_metadata, search_candidates  # noqa: E402
 from normalize import normalize_timed_content  # noqa: E402
-from oxylabs_client import OxylabsClient  # noqa: E402
 from serpapi_client import SerpApiClient  # noqa: E402
-from utils import load_local_env, parse_credentials, parse_serpapi_key  # noqa: E402
+from utils import load_local_env, parse_serpapi_key  # noqa: E402
+from youtube_sources import parse_metadata, search_candidates  # noqa: E402
 
 
 @dataclass
@@ -147,17 +146,12 @@ def extract_renderer_title(renderer: dict[str, Any]) -> str:
     return ""
 
 
-def build_client(provider: str):
-    if provider == "serpapi":
-        return SerpApiClient(parse_serpapi_key(REPO_ROOT))
-    if provider == "oxylabs":
-        username, password = parse_credentials(REPO_ROOT)
-        return OxylabsClient(username, password)
-    raise ValueError(f"Unknown provider: {provider}")
+def build_client() -> SerpApiClient:
+    return SerpApiClient(parse_serpapi_key(REPO_ROOT))
 
 
 def benchmark_search(client: Any, video: ChannelVideo) -> SearchResult:
-    payload, latency, error = timed_call(lambda: client.search(video.title, subtitles=True))
+    payload, latency, error = timed_call(lambda: client.search(video.title))
     if error is not None:
         return SearchResult(
             ok=False,
@@ -303,7 +297,7 @@ def render_markdown(
     finished_at: str,
 ) -> str:
     lines = [
-        "# YouTube Provider Benchmark",
+        "# YouTube SerpApi Benchmark",
         "",
         f"- Channel: {channel_url}",
         f"- Started: {started_at}",
@@ -402,8 +396,8 @@ def write_outputs(
         "summary": summary,
         "results": [asdict(result) for result in results],
     }
-    json_path = output_dir / f"youtube-provider-benchmark-{stamp}.json"
-    md_path = output_dir / f"youtube-provider-benchmark-{stamp}.md"
+    json_path = output_dir / f"youtube-serpapi-benchmark-{stamp}.json"
+    md_path = output_dir / f"youtube-serpapi-benchmark-{stamp}.md"
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(
         render_markdown(
@@ -420,11 +414,10 @@ def write_outputs(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark YouTube search and transcript providers.")
+    parser = argparse.ArgumentParser(description="Benchmark SerpApi YouTube search and transcript retrieval.")
     parser.add_argument("--channel-url", default="https://www.youtube.com/@lexfridman")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--language-code", default="en")
-    parser.add_argument("--providers", default="serpapi,oxylabs")
     parser.add_argument("--output-dir", default="benchmark-results")
     return parser.parse_args()
 
@@ -432,26 +425,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     load_local_env(REPO_ROOT)
-    providers = [item.strip() for item in args.providers.split(",") if item.strip()]
     started_at = datetime.now(timezone.utc).isoformat()
     videos = extract_channel_videos(args.channel_url, args.limit)
     results: list[ProviderVideoResult] = []
 
-    for provider in providers:
-        client = build_client(provider)
-        for index, video in enumerate(videos, start=1):
-            print(f"[{provider}] {index}/{len(videos)} search {video.video_id}", flush=True)
-            search = benchmark_search(client, video)
-            print(f"[{provider}] {index}/{len(videos)} transcript {video.video_id}", flush=True)
-            transcript = benchmark_transcript(client, video, args.language_code)
-            results.append(
-                ProviderVideoResult(
-                    provider=provider,
-                    video=video,
-                    search=search,
-                    transcript=transcript,
-                )
+    client = build_client()
+    for index, video in enumerate(videos, start=1):
+        print(f"[serpapi] {index}/{len(videos)} search {video.video_id}", flush=True)
+        search = benchmark_search(client, video)
+        print(f"[serpapi] {index}/{len(videos)} transcript {video.video_id}", flush=True)
+        transcript = benchmark_transcript(client, video, args.language_code)
+        results.append(
+            ProviderVideoResult(
+                provider="serpapi",
+                video=video,
+                search=search,
+                transcript=transcript,
             )
+        )
 
     finished_at = datetime.now(timezone.utc).isoformat()
     json_path, md_path = write_outputs(

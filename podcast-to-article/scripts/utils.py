@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Sequence
 from urllib.parse import parse_qs, urlparse
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -109,18 +109,6 @@ def resolve_setting(
         if value:
             return value
     return None
-
-
-def parse_credentials(start_path: Optional[Path] = None) -> Tuple[str, str]:
-    env_values = load_local_env(start_path)
-    username = resolve_setting(("OXYLABS_USERNAME",), start_path=start_path, local_env=env_values)
-    password = resolve_setting(("OXYLABS_PASSWORD",), start_path=start_path, local_env=env_values)
-    if not username or not password:
-        raise ValueError(
-            "Missing Oxylabs credentials. Set OXYLABS_USERNAME and OXYLABS_PASSWORD "
-            "in pod2article.config, the system environment, or a local .env file."
-        )
-    return username, password
 
 
 def parse_serpapi_key(start_path: Optional[Path] = None) -> str:

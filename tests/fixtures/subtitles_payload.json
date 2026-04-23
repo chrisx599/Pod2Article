@@ -7,7 +7,7 @@
             "startMs": "0",
             "endMs": "7000",
             "snippet": {
-              "simpleText": "This fallback subtitle payload proves the builder can keep going."
+              "simpleText": "This fallback subtitle payload proves the transcript fetcher can keep going."
             }
           }
         },
@@ -24,4 +24,3 @@
     }
   ]
 }
-

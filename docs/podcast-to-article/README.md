@@ -19,10 +19,10 @@ This skill supports three entry modes:
 The workflow is:
 
 1. Resolve the target video.
-2. Fetch metadata plus transcript or subtitles through SerpApi or Oxylabs.
+2. Fetch metadata plus transcript or subtitles through SerpApi.
 3. Normalize the complete timed transcript into an agent-readable context file.
 4. Read the context file, including metadata, chapters, coverage, and full transcript segments.
-5. Write the article yourself using the transcript context and the Markdown template.
+5. Write the article yourself using the transcript context.
 6. Save the final Markdown output to `articles/<slug>.md`.
 7. Return the article path, transcript context path, coverage status, and any important caveats.
 
@@ -36,24 +36,19 @@ After the transcript fetcher runs:
 - Check `coverage.last_end_sec`, `coverage.span_timestamp`, `segments`, and `chapters`.
 - Use the full transcript context as source material; do not ask the fetcher to write the article for you.
 - If YouTube chapters are available, cover all usable chapters unless the user asks for a shorter piece.
-- Write a coherent article in Markdown using `templates/article-template.md` as the structure.
+- Write a coherent article in Markdown; the codebase intentionally does not generate article drafts.
 - Preserve source fidelity and include clickable timestamp links from the context.
 - In the final response, report the article path, transcript context path, and a short coverage note. Do not lead with an implementation script path.
 
-The bundled fetcher is deterministic and intentionally conservative. It is useful for resolving videos, fetching transcript data, preserving timestamps, and producing source context. The agent is responsible for all article writing when the user asks for an article, essay, polished draft, or publishable output.
+The bundled Python tooling exposes only two capabilities: YouTube search and transcript fetching. The agent is responsible for all article writing when the user asks for an article, essay, polished draft, or publishable output.
 
 ## Runtime requirements
 
-The bundled Python tooling uses SerpApi by default. Oxylabs remains available with `--provider oxylabs`.
+The bundled Python tooling uses SerpApi only.
 
 SerpApi credentials:
 
 - `SERPAPI_API_KEY`
-
-Oxylabs credentials:
-
-- `OXYLABS_USERNAME`
-- `OXYLABS_PASSWORD`
 
 Credential lookup order is:
 
@@ -65,7 +60,13 @@ Do not commit real credentials into the repository.
 
 ## How to use it
 
-Run the bundled transcript fetcher from the project root:
+Search YouTube from the project root:
+
+```bash
+python3 podcast-to-article/scripts/search_youtube.py "$ARGUMENTS" --output-dir search-results
+```
+
+Fetch transcript context from the project root:
 
 ```bash
 python3 podcast-to-article/scripts/fetch_transcript.py "$ARGUMENTS" --output-dir transcripts
@@ -75,12 +76,7 @@ Useful optional flags:
 
 ```bash
 python3 podcast-to-article/scripts/fetch_transcript.py "$ARGUMENTS" --output-dir transcripts --language-code en
-python3 podcast-to-article/scripts/fetch_transcript.py "$ARGUMENTS" --output-dir transcripts --provider serpapi
-python3 podcast-to-article/scripts/fetch_transcript.py "$ARGUMENTS" --output-dir transcripts --provider oxylabs
-python3 podcast-to-article/scripts/fetch_transcript.py "$ARGUMENTS" --output-dir transcripts --search-source youtube_search_max
 ```
-
-The legacy `scripts/build_article.py` still exists for compatibility and can create an automatic draft, but it is not the default workflow for this skill.
 
 ## Output expectations
 
@@ -93,32 +89,50 @@ The delivered article should:
 - Use YouTube second-based links such as `https://www.youtube.com/watch?v=<id>&t=<seconds>s`.
 - Read as a coherent article, not just a list of transcript snippets, when the user asks for a finished article.
 
+## Article Writing Workflow
+
+Use the transcript context as evidence, not as prose to copy. Write the article in the same language as the transcript unless the user asks for translation.
+
+Before drafting:
+
+- Identify the central thesis of the episode from the title, chapters, and recurring arguments.
+- Use `chapters` as the default coverage map; if chapters are missing, group `segments` into 4-8 chronological themes.
+- Select the strongest moments for each section and keep their timestamp URLs available.
+- Prefer synthesis over recap: explain why the ideas matter, how they connect, and where the speaker's reasoning changes.
+
+Recommended Markdown structure:
+
+- `# <article title>`
+- `## Source`
+- `## TL;DR`
+- `## Why This Conversation Matters`
+- `## Main Ideas`
+- `## Key Takeaways`
+- `## Source Timeline`
+
+Writing rules:
+
+- Every main section should include at least one timestamp link from the transcript context.
+- Use direct quotes sparingly; prefer paraphrase plus timestamp links.
+- Do not invent claims, names, dates, or examples that are not supported by the transcript context.
+- Preserve nuance when speakers disagree, hedge, or change their mind.
+- Avoid transcript-cleanup artifacts such as repeated filler, partial sentences, and ASR mistakes unless they are necessary for a quote.
+- If the transcript coverage appears incomplete, state that caveat in the final response and avoid writing beyond the available material.
+
+Quality check before returning:
+
+- The article covers the full transcript or all user-requested scope.
+- The opening states the episode's core idea, not just the guest/topic.
+- Sections read as article prose, not bullet-only notes.
+- Timestamp links point to relevant source moments.
+- The final Markdown is saved under `articles/<slug>.md`.
+
 The transcript context file contains:
 
 - `video`: title, channel, URL, duration, language, and YouTube chapters.
 - `coverage`: segment count, word count, first timestamp, last timestamp, and coverage ratio when duration is known.
 - `chapters`: full transcript text grouped by chapter.
 - `segments`: full timestamped transcript segments with timestamp URLs.
-- `agent_instructions`: reminders that this is source context, not an article.
-
-## Mode selection
-
-Default behavior is single-video deep conversion.
-
-Only use aggregation mode when the user explicitly asks for:
-
-- a roundup
-- a comparison
-- a multi-source article
-- a cross-episode synthesis
-
-If the request does not clearly require multiple videos, stay in single-video mode.
-
-## Supporting files
-
-- For implementation details, see [references/oxylabs-workflow.md](references/oxylabs-workflow.md).
-- For Markdown layout requirements, see [references/article-format.md](references/article-format.md).
-- For the article skeleton, see [templates/article-template.md](templates/article-template.md).
 
 ## Failure handling
 
@@ -127,6 +141,6 @@ Stop and explain the issue if:
 - no usable video can be resolved from the input
 - transcript and subtitles are both unavailable
 - credentials are missing
-- the selected provider returns an unrecoverable API error
+- SerpApi returns an unrecoverable API error
 
 Do not fabricate article content when source text could not be retrieved.

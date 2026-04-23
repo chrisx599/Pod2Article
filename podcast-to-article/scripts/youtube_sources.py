@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import argparse
 import json
-import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,23 +11,30 @@ if __package__ in {None, ""}:
     CURRENT_DIR = Path(__file__).resolve().parent
     if str(CURRENT_DIR) not in sys.path:
         sys.path.insert(0, str(CURRENT_DIR))
-    from article_builder import ArticleSection, VideoCandidate, build_outline_sections, render_article_markdown
     from normalize import Segment, merge_timed_segments, normalize_timed_content
-    from oxylabs_client import OxylabsClient, OxylabsError
-    from serpapi_client import SerpApiClient
-    from utils import detect_input_type, extract_video_id, format_timestamp, load_local_env, parse_credentials, parse_serpapi_key, resolve_setting, slugify
+    from serpapi_client import SerpApiClient, SerpApiError
+    from utils import detect_input_type, extract_video_id, format_timestamp, load_local_env, parse_serpapi_key, slugify
 else:
-    from .article_builder import ArticleSection, VideoCandidate, build_outline_sections, render_article_markdown
     from .normalize import Segment, merge_timed_segments, normalize_timed_content
-    from .oxylabs_client import OxylabsClient, OxylabsError
-    from .serpapi_client import SerpApiClient
-    from .utils import detect_input_type, extract_video_id, format_timestamp, load_local_env, parse_credentials, parse_serpapi_key, resolve_setting, slugify
+    from .serpapi_client import SerpApiClient, SerpApiError
+    from .utils import detect_input_type, extract_video_id, format_timestamp, load_local_env, parse_serpapi_key, slugify
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CODE_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = CODE_ROOT.parent
-DEFAULT_TEMPLATE = CODE_ROOT / "templates" / "article-template.md"
+
+
+@dataclass
+class VideoCandidate:
+    video_id: str
+    title: str
+    channel: str
+    url: str
+    duration_sec: Optional[int]
+    score: float
+    transcript_available: bool
+    subtitles_available: bool
 
 
 @dataclass
@@ -41,26 +46,11 @@ class ResolvedVideo:
     origin: Optional[str] = None
 
 
-def _metadata_chapters(raw_chapters: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_chapters, list):
-        return []
-    chapters: list[dict[str, Any]] = []
-    for index, chapter in enumerate(raw_chapters):
-        if not isinstance(chapter, dict):
-            continue
-        title = chapter.get("title") or chapter.get("chapter") or f"Chapter {index + 1}"
-        start = chapter.get("start_time")
-        if start is None:
-            start = chapter.get("time_start")
-        if start is None and chapter.get("start_ms") is not None:
-            start = int(chapter["start_ms"]) // 1000
-        if start is None:
-            continue
-        start_sec = parse_duration_seconds(start)
-        if start_sec is None:
-            continue
-        chapters.append({"title": str(title).strip(), "start_time": start_sec})
-    return chapters
+def build_runtime_client(client: Optional[Any], credential_root: Path) -> Any:
+    load_local_env(credential_root)
+    if client is not None:
+        return client
+    return SerpApiClient(parse_serpapi_key(credential_root))
 
 
 def parse_duration_seconds(value: Any) -> Optional[int]:
@@ -83,6 +73,25 @@ def parse_duration_seconds(value: Any) -> Optional[int]:
     return None
 
 
+def _metadata_chapters(raw_chapters: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_chapters, list):
+        return []
+    chapters: list[dict[str, Any]] = []
+    for index, chapter in enumerate(raw_chapters):
+        if not isinstance(chapter, dict):
+            continue
+        title = chapter.get("title") or chapter.get("chapter") or f"Chapter {index + 1}"
+        start = chapter.get("start_time")
+        if start is None:
+            start = chapter.get("time_start")
+        if start is None and chapter.get("start_ms") is not None:
+            start = int(chapter["start_ms"]) // 1000
+        start_sec = parse_duration_seconds(start)
+        if start_sec is not None:
+            chapters.append({"title": str(title).strip(), "start_time": start_sec})
+    return chapters
+
+
 def parse_metadata(metadata_payload: dict[str, Any], video_id: str) -> dict[str, Any]:
     if "search_metadata" in metadata_payload and "results" not in metadata_payload:
         search_metadata = metadata_payload.get("search_metadata", {})
@@ -103,18 +112,13 @@ def parse_metadata(metadata_payload: dict[str, Any], video_id: str) -> dict[str,
     content = first.get("content", {})
     parsed = content.get("results", {}) if isinstance(content, dict) else {}
     title = parsed.get("title") or f"Podcast episode {video_id}"
-    channel = parsed.get("uploader") or parsed.get("channel") or "Unknown channel"
-    duration = parse_duration_seconds(parsed.get("duration"))
-    language = parsed.get("language") or "unknown"
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    chapters = _metadata_chapters(parsed.get("chapters"))
     return {
         "title": title,
-        "channel": channel,
-        "duration_sec": duration,
-        "language": language,
-        "url": url,
-        "chapters": chapters,
+        "channel": parsed.get("uploader") or parsed.get("channel") or "Unknown channel",
+        "duration_sec": parse_duration_seconds(parsed.get("duration")),
+        "language": parsed.get("language") or "unknown",
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "chapters": _metadata_chapters(parsed.get("chapters")),
     }
 
 
@@ -188,26 +192,21 @@ def search_candidates(payload: dict[str, Any], query: str) -> list[VideoCandidat
             or _nested_text(item.get("longBylineText"))
             or "Unknown channel"
         )
-        url = item.get("url") or item.get("link") or f"https://www.youtube.com/watch?v={video_id}"
         duration_sec = parse_duration_seconds(
             item.get("durationSeconds") or item.get("duration") or item.get("length") or _nested_text(item.get("lengthText"))
         )
         title_terms = {token for token in slugify(title).split("-") if token}
         channel_terms = {token for token in slugify(channel).split("-") if token}
-        title_overlap = len(query_terms & title_terms)
-        channel_overlap = len(query_terms & channel_terms)
-        duration_bonus = min((duration_sec or 0) / 3600.0, 2.0)
         position = item.get("position_on_page") or fallback_position
         position_bonus = max(0.0, (10.0 - float(position)) * 0.15) if isinstance(position, (int, float)) else 0.0
-        score = title_overlap * 1.5 + channel_overlap * 2.5 + duration_bonus + position_bonus
         candidates.append(
             VideoCandidate(
                 video_id=video_id,
                 title=title,
                 channel=channel,
-                url=url,
+                url=item.get("url") or item.get("link") or f"https://www.youtube.com/watch?v={video_id}",
                 duration_sec=duration_sec,
-                score=score,
+                score=len(query_terms & title_terms) * 1.5 + len(query_terms & channel_terms) * 2.5 + min((duration_sec or 0) / 3600.0, 2.0) + position_bonus,
                 transcript_available=False,
                 subtitles_available=False,
             )
@@ -220,7 +219,6 @@ def resolve_single_video(
     client: Any,
     *,
     language_code: str,
-    search_source: str,
     search_limit: int,
 ) -> ResolvedVideo:
     input_type = detect_input_type(raw_input)
@@ -240,10 +238,10 @@ def resolve_single_video(
         )
         return ResolvedVideo(candidate, probe.metadata, probe.content_payload, probe.source_kind, getattr(probe, "origin", None))
 
-    search_payload = client.search(raw_input, source=search_source, subtitles=True)
+    search_payload = client.search(raw_input)
     candidates = search_candidates(search_payload, raw_input)[:search_limit]
     if not candidates:
-        raise OxylabsError(f"No YouTube candidates were found for query: {raw_input}")
+        raise SerpApiError(f"No YouTube candidates were found for query: {raw_input}")
 
     last_error: Optional[Exception] = None
     for candidate in candidates:
@@ -259,27 +257,35 @@ def resolve_single_video(
             return ResolvedVideo(candidate, probe.metadata, probe.content_payload, probe.source_kind, getattr(probe, "origin", None))
         except Exception as exc:
             last_error = exc
-            continue
-    raise OxylabsError(
-        f"Search results were found for '{raw_input}', but none produced usable transcript or subtitle content."
-    ) from last_error
+    raise SerpApiError(f"Search results were found for '{raw_input}', but none produced usable transcript or subtitle content.") from last_error
 
 
-def load_template(template_path: Path) -> str:
-    return template_path.read_text(encoding="utf-8")
-
-
-def _runtime_client(provider: str, client: Optional[Any], credential_root: Path) -> Any:
-    load_local_env(credential_root)
-    if client is not None:
-        return client
-    if provider not in {"auto", "serpapi", "oxylabs"}:
-        raise ValueError("provider must be one of: auto, serpapi, oxylabs")
-    has_serpapi_key = resolve_setting(("SERPAPI_API_KEY", "SERPAPI_KEY"), start_path=credential_root) is not None
-    if provider == "serpapi" or (provider == "auto" and has_serpapi_key):
-        return SerpApiClient(parse_serpapi_key(credential_root))
-    username, password = parse_credentials(credential_root)
-    return OxylabsClient(username, password)
+def search_youtube_context(
+    query: str,
+    *,
+    output_dir: Path,
+    client: Optional[Any] = None,
+) -> Path:
+    runtime_client = build_runtime_client(client, Path.cwd())
+    payload = runtime_client.search(query)
+    candidates = search_candidates(payload, query)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / f"{slugify(query, fallback='youtube-search')}.search.json"
+    destination.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "query": query,
+                "provider": "serpapi",
+                "candidates": [candidate.__dict__ for candidate in candidates],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return destination
 
 
 def _segment_end_sec(segment: Segment) -> int:
@@ -299,32 +305,21 @@ def _chapter_for_segment(chapters: list[dict[str, Any]], start_sec: int) -> Opti
     return active
 
 
-def _chapter_context(
-    segments: list[Segment],
-    chapters: list[dict[str, Any]],
-    video_id: str,
-) -> list[dict[str, Any]]:
-    if not chapters:
-        return []
+def _chapter_context(segments: list[Segment], chapters: list[dict[str, Any]], video_id: str) -> list[dict[str, Any]]:
     normalized = sorted(chapters, key=lambda item: int(item["start_time"]))
     chapter_payloads: list[dict[str, Any]] = []
     for index, chapter in enumerate(normalized):
         start_sec = int(chapter["start_time"])
         end_sec = int(normalized[index + 1]["start_time"]) if index + 1 < len(normalized) else None
-        matching = [
-            segment
-            for segment in segments
-            if segment.start_sec >= start_sec and (end_sec is None or segment.start_sec < end_sec)
-        ]
+        matching = [segment for segment in segments if segment.start_sec >= start_sec and (end_sec is None or segment.start_sec < end_sec)]
         if not matching:
             continue
-        chapter_end = _segment_end_sec(matching[-1])
         chapter_payloads.append(
             {
                 "index": index,
                 "title": str(chapter["title"]),
                 "start_sec": start_sec,
-                "end_sec": chapter_end,
+                "end_sec": _segment_end_sec(matching[-1]),
                 "timestamp": format_timestamp(start_sec),
                 "url": f"https://www.youtube.com/watch?v={video_id}&t={start_sec}s",
                 "segment_count": len(matching),
@@ -373,28 +368,25 @@ def fetch_transcript_context(
     *,
     output_dir: Path,
     language_code: str = "en",
-    search_source: str = "youtube_search",
     search_limit: int = 5,
-    provider: str = "serpapi",
     client: Optional[Any] = None,
 ) -> Path:
-    credential_root = Path.cwd()
-    runtime_client = _runtime_client(provider, client, credential_root)
+    runtime_client = build_runtime_client(client, Path.cwd())
     resolved = resolve_single_video(
         raw_input,
         runtime_client,
         language_code=language_code,
-        search_source=search_source,
         search_limit=search_limit,
     )
     metadata = parse_metadata(resolved.metadata_payload, resolved.candidate.video_id)
-    segments = normalize_timed_content(
-        resolved.content_payload,
-        video_id=resolved.candidate.video_id,
-        source_kind=resolved.source_kind,
-        language=metadata["language"],
+    segments = merge_timed_segments(
+        normalize_timed_content(
+            resolved.content_payload,
+            video_id=resolved.candidate.video_id,
+            source_kind=resolved.source_kind,
+            language=metadata["language"],
+        )
     )
-    segments = merge_timed_segments(segments)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / f"{slugify(metadata['title'], fallback=resolved.candidate.video_id)}.transcript.json"
@@ -402,7 +394,7 @@ def fetch_transcript_context(
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "input": raw_input,
-        "provider": provider,
+        "provider": "serpapi",
         "source_kind": resolved.source_kind,
         "origin": resolved.origin,
         "video": {
@@ -417,125 +409,6 @@ def fetch_transcript_context(
         "coverage": _coverage_payload(segments, metadata["duration_sec"]),
         "chapters": _chapter_context(segments, metadata.get("chapters", []), resolved.candidate.video_id),
         "segments": _segments_payload(segments, metadata.get("chapters", []), resolved.candidate.video_id),
-        "agent_instructions": {
-            "purpose": "Use this complete transcript context as source material for writing the article.",
-            "do_not_treat_as_article": True,
-            "preserve_timestamp_links": True,
-        },
     }
     destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return destination
-
-
-def build_article(
-    raw_input: str,
-    *,
-    output_dir: Path,
-    language_code: str = "en",
-    mode: str = "single",
-    search_source: str = "youtube_search",
-    search_limit: int = 5,
-    provider: str = "serpapi",
-    template_path: Path = DEFAULT_TEMPLATE,
-    client: Optional[Any] = None,
-) -> Path:
-    if mode != "single":
-        raise NotImplementedError(
-            "Aggregation mode is reserved for explicit multi-source requests and is not implemented in v1."
-        )
-
-    credential_root = Path.cwd()
-    runtime_client = _runtime_client(provider, client, credential_root)
-
-    resolved = resolve_single_video(
-        raw_input,
-        runtime_client,
-        language_code=language_code,
-        search_source=search_source,
-        search_limit=search_limit,
-    )
-    metadata = parse_metadata(resolved.metadata_payload, resolved.candidate.video_id)
-    segments = normalize_timed_content(
-        resolved.content_payload,
-        video_id=resolved.candidate.video_id,
-        source_kind=resolved.source_kind,
-        language=metadata["language"],
-    )
-    segments = merge_timed_segments(segments)
-    sections: list[ArticleSection] = build_outline_sections(segments, chapters=metadata.get("chapters"))
-    article_title = f"{metadata['title']} - Article"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    template_text = load_template(template_path)
-    markdown = render_article_markdown(
-        title=article_title,
-        source_title=metadata["title"],
-        channel=metadata["channel"],
-        video_url=metadata["url"],
-        language=metadata["language"],
-        sections=sections,
-        template_text=template_text,
-    )
-    destination = output_dir / f"{slugify(metadata['title'])}.md"
-    destination.write_text(markdown, encoding="utf-8")
-    return destination
-
-
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Turn a YouTube podcast URL, video ID, or search query into a Markdown article."
-    )
-    parser.add_argument("input", help="A YouTube URL, a video ID, or a search query.")
-    parser.add_argument("--output-dir", default="articles", help="Directory where the Markdown article should be saved.")
-    parser.add_argument("--language-code", default="en", help="Preferred transcript/subtitle language code.")
-    parser.add_argument(
-        "--provider",
-        choices=["auto", "serpapi", "oxylabs"],
-        default="serpapi",
-        help="API provider. SerpApi is the default; use oxylabs to force the legacy path.",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["single", "aggregate"],
-        default="single",
-        help="Content generation mode. Aggregation mode is intentionally deferred in v1.",
-    )
-    parser.add_argument(
-        "--search-source",
-        choices=["youtube_search", "youtube_search_max"],
-        default="youtube_search",
-        help="Oxylabs search source to use for query-based resolution. Ignored by SerpApi.",
-    )
-    parser.add_argument("--search-limit", type=int, default=5, help="Maximum number of ranked search candidates to probe.")
-    return parser.parse_args(argv)
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    args = parse_args(argv)
-    try:
-        output_path = build_article(
-            args.input,
-            output_dir=(REPO_ROOT / args.output_dir).resolve() if not Path(args.output_dir).is_absolute() else Path(args.output_dir),
-            language_code=args.language_code,
-            mode=args.mode,
-            search_source=args.search_source,
-            search_limit=args.search_limit,
-            provider=args.provider,
-        )
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-
-    print(
-        json.dumps(
-            {
-                "status": "ok",
-                "output_path": str(output_path),
-            },
-            indent=2,
-        )
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
