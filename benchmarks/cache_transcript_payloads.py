@@ -22,9 +22,9 @@ from utils import load_local_env, parse_credentials, parse_serpapi_key  # noqa: 
 
 def build_client(provider: str) -> Any:
     if provider == "serpapi":
-        return SerpApiClient(parse_serpapi_key())
+        return SerpApiClient(parse_serpapi_key(REPO_ROOT))
     if provider == "oxylabs":
-        username, password = parse_credentials()
+        username, password = parse_credentials(REPO_ROOT)
         return OxylabsClient(username, password)
     raise ValueError(f"Unsupported provider: {provider}")
 

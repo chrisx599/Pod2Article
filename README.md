@@ -4,11 +4,17 @@ Turn a YouTube podcast URL, video ID, or search query into a Markdown article wi
 
 ## Usage
 
-SerpApi is the default provider. Put credentials in `.env`:
+SerpApi is the default provider. Put credentials in `pod2article.config`:
 
 ```bash
 SERPAPI_API_KEY=your-serpapi-api-key
 ```
+
+Credential lookup order is:
+
+1. `pod2article.config`, `.pod2article.config`, or `config.env`
+2. system environment variables
+3. local `.env`
 
 Generate an article:
 

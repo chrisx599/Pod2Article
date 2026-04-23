@@ -149,9 +149,9 @@ def extract_renderer_title(renderer: dict[str, Any]) -> str:
 
 def build_client(provider: str):
     if provider == "serpapi":
-        return SerpApiClient(parse_serpapi_key())
+        return SerpApiClient(parse_serpapi_key(REPO_ROOT))
     if provider == "oxylabs":
-        username, password = parse_credentials()
+        username, password = parse_credentials(REPO_ROOT)
         return OxylabsClient(username, password)
     raise ValueError(f"Unknown provider: {provider}")
 

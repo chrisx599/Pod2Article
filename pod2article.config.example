@@ -1,0 +1,9 @@
+# Copy to pod2article.config for local use.
+# Credential resolution order is:
+# 1. pod2article.config / .pod2article.config / config.env
+# 2. system environment variables
+# 3. local .env
+
+SERPAPI_API_KEY=your-serpapi-api-key
+OXYLABS_USERNAME=your-oxylabs-username
+OXYLABS_PASSWORD=your-oxylabs-password

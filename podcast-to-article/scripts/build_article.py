@@ -16,13 +16,13 @@ if __package__ in {None, ""}:
     from normalize import merge_timed_segments, normalize_timed_content
     from oxylabs_client import OxylabsClient, OxylabsError
     from serpapi_client import SerpApiClient
-    from utils import detect_input_type, extract_video_id, load_local_env, parse_credentials, parse_serpapi_key, slugify
+    from utils import detect_input_type, extract_video_id, load_local_env, parse_credentials, parse_serpapi_key, resolve_setting, slugify
 else:
     from .article_builder import ArticleSection, VideoCandidate, build_outline_sections, render_article_markdown
     from .normalize import merge_timed_segments, normalize_timed_content
     from .oxylabs_client import OxylabsClient, OxylabsError
     from .serpapi_client import SerpApiClient
-    from .utils import detect_input_type, extract_video_id, load_local_env, parse_credentials, parse_serpapi_key, slugify
+    from .utils import detect_input_type, extract_video_id, load_local_env, parse_credentials, parse_serpapi_key, resolve_setting, slugify
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -284,15 +284,17 @@ def build_article(
             "Aggregation mode is reserved for explicit multi-source requests and is not implemented in v1."
         )
 
-    load_local_env(REPO_ROOT)
+    credential_root = Path.cwd()
+    load_local_env(credential_root)
     runtime_client = client
     if runtime_client is None:
         if provider not in {"auto", "serpapi", "oxylabs"}:
             raise ValueError("provider must be one of: auto, serpapi, oxylabs")
-        if provider == "serpapi" or (provider == "auto" and ("SERPAPI_API_KEY" in os.environ or "SERPAPI_KEY" in os.environ)):
-            runtime_client = SerpApiClient(parse_serpapi_key())
+        has_serpapi_key = resolve_setting(("SERPAPI_API_KEY", "SERPAPI_KEY"), start_path=credential_root) is not None
+        if provider == "serpapi" or (provider == "auto" and has_serpapi_key):
+            runtime_client = SerpApiClient(parse_serpapi_key(credential_root))
         else:
-            username, password = parse_credentials()
+            username, password = parse_credentials(credential_root)
             runtime_client = OxylabsClient(username, password)
 
     resolved = resolve_single_video(

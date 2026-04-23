@@ -52,4 +52,10 @@ The scripts read credentials from:
 - `OXYLABS_USERNAME`
 - `OXYLABS_PASSWORD`
 
-Local development may use a `.env` file in the repository root, but real credentials must not be committed.
+Credential lookup order is:
+
+1. `pod2article.config`, `.pod2article.config`, or `config.env`
+2. system environment variables
+3. local `.env`
+
+Local development may use a config file or `.env` file in the repository root, but real credentials must not be committed.

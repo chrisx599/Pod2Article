@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlparse
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -36,45 +36,100 @@ STOPWORDS = {
 }
 
 
+CONFIG_FILENAMES = ("pod2article.config", ".pod2article.config", "config.env")
+
+
+def _parse_key_value_file(path: Path) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key:
+            values[key] = value
+    return values
+
+
+def _find_upwards(start_path: Path, filenames: Sequence[str]) -> Optional[Path]:
+    start = Path(start_path).resolve()
+    if start.is_file():
+        start = start.parent
+    for candidate_dir in [start, *start.parents]:
+        for filename in filenames:
+            path = candidate_dir / filename
+            if path.exists():
+                return path
+    return None
+
+
 def load_local_env(start_path: Optional[Path] = None) -> Dict[str, str]:
     """Load simple KEY=VALUE pairs from a local .env file if present."""
-    start = Path(start_path or Path.cwd()).resolve()
-    for candidate in [start, *start.parents]:
-        env_path = candidate / ".env"
-        if not env_path.exists():
-            continue
-        values: Dict[str, str] = {}
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip("'").strip('"')
-            if key and key not in os.environ:
-                os.environ[key] = value
-            if key:
-                values[key] = value
-        return values
-    return {}
+    env_path = _find_upwards(Path(start_path or Path.cwd()), (".env",))
+    if env_path is None:
+        return {}
+    values = _parse_key_value_file(env_path)
+    for key, value in values.items():
+        if key not in os.environ:
+            os.environ[key] = value
+    return values
 
 
-def parse_credentials() -> Tuple[str, str]:
-    username = os.environ.get("OXYLABS_USERNAME")
-    password = os.environ.get("OXYLABS_PASSWORD")
+def load_config_file(start_path: Optional[Path] = None) -> Dict[str, str]:
+    """Read project config without mutating process environment."""
+    config_path = _find_upwards(Path(start_path or Path.cwd()), CONFIG_FILENAMES)
+    if config_path is None:
+        return {}
+    return _parse_key_value_file(config_path)
+
+
+def resolve_setting(
+    keys: Sequence[str],
+    *,
+    start_path: Optional[Path] = None,
+    local_env: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """Resolve a setting from config, system env, then local .env."""
+    config_values = load_config_file(start_path)
+    for key in keys:
+        value = config_values.get(key)
+        if value:
+            return value
+    for key in keys:
+        value = os.environ.get(key)
+        if value:
+            return value
+    env_values = local_env if local_env is not None else load_local_env(start_path)
+    for key in keys:
+        value = env_values.get(key)
+        if value:
+            return value
+    return None
+
+
+def parse_credentials(start_path: Optional[Path] = None) -> Tuple[str, str]:
+    env_values = load_local_env(start_path)
+    username = resolve_setting(("OXYLABS_USERNAME",), start_path=start_path, local_env=env_values)
+    password = resolve_setting(("OXYLABS_PASSWORD",), start_path=start_path, local_env=env_values)
     if not username or not password:
         raise ValueError(
-            "Missing Oxylabs credentials. Set OXYLABS_USERNAME and "
-            "OXYLABS_PASSWORD or provide them in a local .env file."
+            "Missing Oxylabs credentials. Set OXYLABS_USERNAME and OXYLABS_PASSWORD "
+            "in pod2article.config, the system environment, or a local .env file."
         )
     return username, password
 
 
-def parse_serpapi_key() -> str:
-    api_key = os.environ.get("SERPAPI_API_KEY") or os.environ.get("SERPAPI_KEY")
+def parse_serpapi_key(start_path: Optional[Path] = None) -> str:
+    env_values = load_local_env(start_path)
+    api_key = resolve_setting(("SERPAPI_API_KEY", "SERPAPI_KEY"), start_path=start_path, local_env=env_values)
     if not api_key:
         raise ValueError(
-            "Missing SerpApi credentials. Set SERPAPI_API_KEY or provide it in a local .env file."
+            "Missing SerpApi credentials. Set SERPAPI_API_KEY in pod2article.config, "
+            "the system environment, or a local .env file."
         )
     return api_key
 

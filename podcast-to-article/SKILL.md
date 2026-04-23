@@ -38,7 +38,13 @@ Oxylabs credentials:
 - `OXYLABS_USERNAME`
 - `OXYLABS_PASSWORD`
 
-It also supports loading a local `.env` file in the project root. Do not hardcode secrets into the repository.
+Credential lookup order is:
+
+1. `pod2article.config`, `.pod2article.config`, or `config.env`
+2. system environment variables
+3. local `.env`
+
+Do not commit real credentials into the repository.
 
 ## How to use it
 

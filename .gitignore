@@ -1,6 +1,9 @@
 .env
 .env.*
 !.env.example
+pod2article.config
+.pod2article.config
+config.env
 __pycache__/
 *.pyc
 .DS_Store

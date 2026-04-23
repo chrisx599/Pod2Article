@@ -16,6 +16,9 @@ from utils import (  # noqa: E402
     extract_video_id,
     format_timestamp,
     load_local_env,
+    parse_credentials,
+    parse_serpapi_key,
+    resolve_setting,
     slugify,
 )
 
@@ -58,6 +61,53 @@ class UtilsTestCase(unittest.TestCase):
                     os.environ["OXYLABS_PASSWORD"] = old_pass
                 else:
                     os.environ.pop("OXYLABS_PASSWORD", None)
+
+    def test_resolve_setting_prefers_config_over_environment_and_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "pod2article.config").write_text("SERPAPI_API_KEY=config-key\n", encoding="utf-8")
+            (root / ".env").write_text("SERPAPI_API_KEY=env-file-key\n", encoding="utf-8")
+            old_key = os.environ.get("SERPAPI_API_KEY")
+            os.environ["SERPAPI_API_KEY"] = "system-key"
+            try:
+                self.assertEqual(resolve_setting(("SERPAPI_API_KEY",), start_path=root), "config-key")
+                self.assertEqual(parse_serpapi_key(root), "config-key")
+            finally:
+                if old_key is None:
+                    os.environ.pop("SERPAPI_API_KEY", None)
+                else:
+                    os.environ["SERPAPI_API_KEY"] = old_key
+
+    def test_resolve_setting_prefers_environment_over_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".env").write_text("SERPAPI_API_KEY=env-file-key\n", encoding="utf-8")
+            old_key = os.environ.get("SERPAPI_API_KEY")
+            os.environ["SERPAPI_API_KEY"] = "system-key"
+            try:
+                self.assertEqual(resolve_setting(("SERPAPI_API_KEY",), start_path=root), "system-key")
+            finally:
+                if old_key is None:
+                    os.environ.pop("SERPAPI_API_KEY", None)
+                else:
+                    os.environ["SERPAPI_API_KEY"] = old_key
+
+    def test_parse_credentials_reads_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".pod2article.config").write_text(
+                "OXYLABS_USERNAME=config-user\nOXYLABS_PASSWORD=config-pass\n",
+                encoding="utf-8",
+            )
+            old_user = os.environ.pop("OXYLABS_USERNAME", None)
+            old_pass = os.environ.pop("OXYLABS_PASSWORD", None)
+            try:
+                self.assertEqual(parse_credentials(root), ("config-user", "config-pass"))
+            finally:
+                if old_user is not None:
+                    os.environ["OXYLABS_USERNAME"] = old_user
+                if old_pass is not None:
+                    os.environ["OXYLABS_PASSWORD"] = old_pass
 
 
 if __name__ == "__main__":
