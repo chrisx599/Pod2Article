@@ -166,7 +166,7 @@ def build_outline_sections(
     sections: list[ArticleSection] = []
     chapter_groups = _group_by_chapters(segments, chapters or [])
     if chapter_groups:
-        grouped_chunks = chapter_groups[:target_sections]
+        grouped_chunks = chapter_groups
     else:
         label_groups = _group_by_labels(segments)
         if label_groups:
