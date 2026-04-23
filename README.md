@@ -16,16 +16,24 @@ Credential lookup order is:
 2. system environment variables
 3. local `.env`
 
-Generate an article:
+Fetch complete transcript context for an agent-written article:
 
 ```bash
-python3 podcast-to-article/scripts/build_article.py "https://www.youtube.com/watch?v=hmtuvNfytjM" --output-dir articles
+python3 podcast-to-article/scripts/fetch_transcript.py "https://www.youtube.com/watch?v=hmtuvNfytjM" --output-dir transcripts
 ```
 
 Use Oxylabs instead:
 
 ```bash
-python3 podcast-to-article/scripts/build_article.py "search query" --provider oxylabs --output-dir articles
+python3 podcast-to-article/scripts/fetch_transcript.py "search query" --provider oxylabs --output-dir transcripts
+```
+
+The transcript fetcher writes `transcripts/<slug>.transcript.json` with metadata, coverage, chapters, and full timestamped transcript segments. Agents should use that context plus `podcast-to-article/templates/article-template.md` to write the final article.
+
+The legacy automatic draft generator is still available for compatibility:
+
+```bash
+python3 podcast-to-article/scripts/build_article.py "https://www.youtube.com/watch?v=hmtuvNfytjM" --output-dir articles
 ```
 
 ## Benchmarks

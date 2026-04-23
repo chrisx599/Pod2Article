@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,16 +14,16 @@ if __package__ in {None, ""}:
     if str(CURRENT_DIR) not in sys.path:
         sys.path.insert(0, str(CURRENT_DIR))
     from article_builder import ArticleSection, VideoCandidate, build_outline_sections, render_article_markdown
-    from normalize import merge_timed_segments, normalize_timed_content
+    from normalize import Segment, merge_timed_segments, normalize_timed_content
     from oxylabs_client import OxylabsClient, OxylabsError
     from serpapi_client import SerpApiClient
-    from utils import detect_input_type, extract_video_id, load_local_env, parse_credentials, parse_serpapi_key, resolve_setting, slugify
+    from utils import detect_input_type, extract_video_id, format_timestamp, load_local_env, parse_credentials, parse_serpapi_key, resolve_setting, slugify
 else:
     from .article_builder import ArticleSection, VideoCandidate, build_outline_sections, render_article_markdown
-    from .normalize import merge_timed_segments, normalize_timed_content
+    from .normalize import Segment, merge_timed_segments, normalize_timed_content
     from .oxylabs_client import OxylabsClient, OxylabsError
     from .serpapi_client import SerpApiClient
-    from .utils import detect_input_type, extract_video_id, load_local_env, parse_credentials, parse_serpapi_key, resolve_setting, slugify
+    from .utils import detect_input_type, extract_video_id, format_timestamp, load_local_env, parse_credentials, parse_serpapi_key, resolve_setting, slugify
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -37,6 +38,7 @@ class ResolvedVideo:
     metadata_payload: dict[str, Any]
     content_payload: dict[str, Any]
     source_kind: str
+    origin: Optional[str] = None
 
 
 def _metadata_chapters(raw_chapters: Any) -> list[dict[str, Any]]:
@@ -236,7 +238,7 @@ def resolve_single_video(
             transcript_available=probe.source_kind == "transcript",
             subtitles_available=probe.source_kind == "subtitles",
         )
-        return ResolvedVideo(candidate, probe.metadata, probe.content_payload, probe.source_kind)
+        return ResolvedVideo(candidate, probe.metadata, probe.content_payload, probe.source_kind, getattr(probe, "origin", None))
 
     search_payload = client.search(raw_input, source=search_source, subtitles=True)
     candidates = search_candidates(search_payload, raw_input)[:search_limit]
@@ -254,7 +256,7 @@ def resolve_single_video(
             candidate.duration_sec = parsed["duration_sec"]
             candidate.transcript_available = probe.source_kind == "transcript"
             candidate.subtitles_available = probe.source_kind == "subtitles"
-            return ResolvedVideo(candidate, probe.metadata, probe.content_payload, probe.source_kind)
+            return ResolvedVideo(candidate, probe.metadata, probe.content_payload, probe.source_kind, getattr(probe, "origin", None))
         except Exception as exc:
             last_error = exc
             continue
@@ -265,6 +267,164 @@ def resolve_single_video(
 
 def load_template(template_path: Path) -> str:
     return template_path.read_text(encoding="utf-8")
+
+
+def _runtime_client(provider: str, client: Optional[Any], credential_root: Path) -> Any:
+    load_local_env(credential_root)
+    if client is not None:
+        return client
+    if provider not in {"auto", "serpapi", "oxylabs"}:
+        raise ValueError("provider must be one of: auto, serpapi, oxylabs")
+    has_serpapi_key = resolve_setting(("SERPAPI_API_KEY", "SERPAPI_KEY"), start_path=credential_root) is not None
+    if provider == "serpapi" or (provider == "auto" and has_serpapi_key):
+        return SerpApiClient(parse_serpapi_key(credential_root))
+    username, password = parse_credentials(credential_root)
+    return OxylabsClient(username, password)
+
+
+def _segment_end_sec(segment: Segment) -> int:
+    return int(segment.end_sec if segment.end_sec is not None else segment.start_sec)
+
+
+def _segment_words(segments: list[Segment]) -> int:
+    return sum(len(segment.text.split()) for segment in segments)
+
+
+def _chapter_for_segment(chapters: list[dict[str, Any]], start_sec: int) -> Optional[str]:
+    active: Optional[str] = None
+    for chapter in sorted(chapters, key=lambda item: int(item["start_time"])):
+        if start_sec < int(chapter["start_time"]):
+            break
+        active = str(chapter["title"])
+    return active
+
+
+def _chapter_context(
+    segments: list[Segment],
+    chapters: list[dict[str, Any]],
+    video_id: str,
+) -> list[dict[str, Any]]:
+    if not chapters:
+        return []
+    normalized = sorted(chapters, key=lambda item: int(item["start_time"]))
+    chapter_payloads: list[dict[str, Any]] = []
+    for index, chapter in enumerate(normalized):
+        start_sec = int(chapter["start_time"])
+        end_sec = int(normalized[index + 1]["start_time"]) if index + 1 < len(normalized) else None
+        matching = [
+            segment
+            for segment in segments
+            if segment.start_sec >= start_sec and (end_sec is None or segment.start_sec < end_sec)
+        ]
+        if not matching:
+            continue
+        chapter_end = _segment_end_sec(matching[-1])
+        chapter_payloads.append(
+            {
+                "index": index,
+                "title": str(chapter["title"]),
+                "start_sec": start_sec,
+                "end_sec": chapter_end,
+                "timestamp": format_timestamp(start_sec),
+                "url": f"https://www.youtube.com/watch?v={video_id}&t={start_sec}s",
+                "segment_count": len(matching),
+                "word_count": _segment_words(matching),
+                "text": "\n".join(segment.text.strip() for segment in matching if segment.text.strip()),
+            }
+        )
+    return chapter_payloads
+
+
+def _segments_payload(segments: list[Segment], chapters: list[dict[str, Any]], video_id: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "index": index,
+            "start_sec": int(segment.start_sec),
+            "end_sec": _segment_end_sec(segment),
+            "timestamp": format_timestamp(segment.start_sec),
+            "url": f"https://www.youtube.com/watch?v={video_id}&t={int(segment.start_sec)}s",
+            "chapter": segment.label or _chapter_for_segment(chapters, int(segment.start_sec)),
+            "text": segment.text,
+        }
+        for index, segment in enumerate(segments)
+    ]
+
+
+def _coverage_payload(segments: list[Segment], duration_sec: Optional[int]) -> dict[str, Any]:
+    first_start = min((int(segment.start_sec) for segment in segments), default=0)
+    last_end = max((_segment_end_sec(segment) for segment in segments), default=0)
+    span_sec = max(last_end - first_start, 0)
+    payload: dict[str, Any] = {
+        "segments_count": len(segments),
+        "words_count": _segment_words(segments),
+        "first_start_sec": first_start,
+        "last_end_sec": last_end,
+        "span_sec": span_sec,
+        "span_timestamp": format_timestamp(span_sec),
+    }
+    if duration_sec:
+        payload["duration_sec"] = duration_sec
+        payload["coverage_ratio"] = round(last_end / duration_sec, 4)
+    return payload
+
+
+def fetch_transcript_context(
+    raw_input: str,
+    *,
+    output_dir: Path,
+    language_code: str = "en",
+    search_source: str = "youtube_search",
+    search_limit: int = 5,
+    provider: str = "serpapi",
+    client: Optional[Any] = None,
+) -> Path:
+    credential_root = Path.cwd()
+    runtime_client = _runtime_client(provider, client, credential_root)
+    resolved = resolve_single_video(
+        raw_input,
+        runtime_client,
+        language_code=language_code,
+        search_source=search_source,
+        search_limit=search_limit,
+    )
+    metadata = parse_metadata(resolved.metadata_payload, resolved.candidate.video_id)
+    segments = normalize_timed_content(
+        resolved.content_payload,
+        video_id=resolved.candidate.video_id,
+        source_kind=resolved.source_kind,
+        language=metadata["language"],
+    )
+    segments = merge_timed_segments(segments)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / f"{slugify(metadata['title'], fallback=resolved.candidate.video_id)}.transcript.json"
+    payload = {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "input": raw_input,
+        "provider": provider,
+        "source_kind": resolved.source_kind,
+        "origin": resolved.origin,
+        "video": {
+            "video_id": resolved.candidate.video_id,
+            "title": metadata["title"],
+            "channel": metadata["channel"],
+            "duration_sec": metadata["duration_sec"],
+            "language": metadata["language"],
+            "url": metadata["url"],
+            "chapters": metadata.get("chapters", []),
+        },
+        "coverage": _coverage_payload(segments, metadata["duration_sec"]),
+        "chapters": _chapter_context(segments, metadata.get("chapters", []), resolved.candidate.video_id),
+        "segments": _segments_payload(segments, metadata.get("chapters", []), resolved.candidate.video_id),
+        "agent_instructions": {
+            "purpose": "Use this complete transcript context as source material for writing the article.",
+            "do_not_treat_as_article": True,
+            "preserve_timestamp_links": True,
+        },
+    }
+    destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return destination
 
 
 def build_article(
@@ -285,17 +445,7 @@ def build_article(
         )
 
     credential_root = Path.cwd()
-    load_local_env(credential_root)
-    runtime_client = client
-    if runtime_client is None:
-        if provider not in {"auto", "serpapi", "oxylabs"}:
-            raise ValueError("provider must be one of: auto, serpapi, oxylabs")
-        has_serpapi_key = resolve_setting(("SERPAPI_API_KEY", "SERPAPI_KEY"), start_path=credential_root) is not None
-        if provider == "serpapi" or (provider == "auto" and has_serpapi_key):
-            runtime_client = SerpApiClient(parse_serpapi_key(credential_root))
-        else:
-            username, password = parse_credentials(credential_root)
-            runtime_client = OxylabsClient(username, password)
+    runtime_client = _runtime_client(provider, client, credential_root)
 
     resolved = resolve_single_video(
         raw_input,

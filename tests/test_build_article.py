@@ -11,7 +11,7 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1] / "podcast-to-article" / "scrip
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from build_article import build_article, parse_metadata, search_candidates  # noqa: E402
+from build_article import build_article, fetch_transcript_context, parse_metadata, search_candidates  # noqa: E402
 from oxylabs_client import OxylabsError  # noqa: E402
 
 
@@ -97,6 +97,28 @@ class BuildArticleTestCase(unittest.TestCase):
                 search_source="youtube_search",
             )
             self.assertTrue(destination.exists())
+
+    def test_fetch_transcript_context_returns_complete_source_payload(self) -> None:
+        fixtures = {
+            "search": self._fixture("search_payload.json"),
+            "metadata": self._fixture("metadata_payload.json"),
+            "transcript": self._fixture("transcript_payload.json"),
+            "subtitles": self._fixture("subtitles_payload.json"),
+        }
+        client = FakeClient(fixtures)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            destination = fetch_transcript_context(
+                "https://www.youtube.com/watch?v=abc123def45",
+                output_dir=Path(tmpdir),
+                client=client,
+            )
+            payload = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertTrue(destination.name.endswith(".transcript.json"))
+            self.assertEqual(payload["video"]["video_id"], "abc123def45")
+            self.assertEqual(payload["coverage"]["segments_count"], len(payload["segments"]))
+            self.assertGreater(payload["coverage"]["words_count"], 0)
+            self.assertTrue(payload["agent_instructions"]["do_not_treat_as_article"])
+            self.assertIn("text", payload["segments"][0])
 
     def test_search_candidates_supports_raw_oxylabs_payload(self) -> None:
         payload = self._fixture("raw_search_payload.json")
