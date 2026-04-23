@@ -1,0 +1,37 @@
+{
+  "results": [
+    {
+      "content": [
+        {
+          "transcriptSectionHeaderRenderer": {
+            "sectionHeader": {
+              "sectionHeaderViewModel": {
+                "headline": {
+                  "content": "Accessibility-backed transcript"
+                }
+              }
+            }
+          }
+        },
+        {
+          "transcriptSegmentRenderer": {
+            "startMs": "84080",
+            "endMs": "92560",
+            "snippet": {
+              "runs": [
+                {
+                  "text": "How are you? Great to meet you."
+                }
+              ]
+            },
+            "accessibility": {
+              "accessibilityData": {
+                "label": "1 minute, 24 seconds How are you? Great to meet you. Thanks for doing this. Absolutely."
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

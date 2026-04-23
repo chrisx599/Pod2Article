@@ -1,0 +1,27 @@
+{
+  "results": [
+    {
+      "content": [
+        {
+          "cueRenderer": {
+            "startMs": "0",
+            "endMs": "7000",
+            "snippet": {
+              "simpleText": "This fallback subtitle payload proves the builder can keep going."
+            }
+          }
+        },
+        {
+          "cueRenderer": {
+            "startMs": "7000",
+            "endMs": "14000",
+            "snippet": {
+              "simpleText": "Even when transcripts fail, timestamped subtitles are enough to build article sections."
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+

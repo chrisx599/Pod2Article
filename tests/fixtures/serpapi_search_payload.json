@@ -1,0 +1,36 @@
+{
+  "search_metadata": {
+    "status": "Success",
+    "youtube_url": "https://www.youtube.com/results?search_query=Sam+Altman+GPT+5+Cleo+Abram"
+  },
+  "video_results": [
+    {
+      "position_on_page": 1,
+      "title": "Cleo Abram & Sam Altman Podcast Reaction: What GPT-5 & Open AI Means for the Future",
+      "link": "https://www.youtube.com/watch?v=baCtmY5ue44",
+      "video_id": "baCtmY5ue44",
+      "channel": {
+        "name": "STONEDAPE-PRODUCTIONS",
+        "link": "https://www.youtube.com/@STONEDAPE-PRODUCTIONS"
+      },
+      "published_date": "8 months ago",
+      "views": 122,
+      "length": "42:40",
+      "description": "Reaction to the Sam Altman and Cleo Abram podcast."
+    },
+    {
+      "position_on_page": 2,
+      "title": "Sam Altman Shows Me GPT 5... And What's Next",
+      "link": "https://www.youtube.com/watch?v=hmtuvNfytjM",
+      "video_id": "hmtuvNfytjM",
+      "channel": {
+        "name": "Cleo Abram",
+        "link": "https://www.youtube.com/@CleoAbram"
+      },
+      "published_date": "8 months ago",
+      "views": 4582399,
+      "length": "1:05:07",
+      "description": "We're about to time travel into the future Sam Altman is building."
+    }
+  ]
+}

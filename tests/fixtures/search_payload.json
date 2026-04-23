@@ -1,0 +1,25 @@
+{
+  "results": [
+    {
+      "content": {
+        "results": [
+          {
+            "videoId": "abc123def45",
+            "title": "AI Podcast: Building Agents for Content Workflows",
+            "channel": "Agent Lab",
+            "durationSeconds": 5420,
+            "url": "https://www.youtube.com/watch?v=abc123def45"
+          },
+          {
+            "videoId": "zzz999yyy88",
+            "title": "Short AI News Clip",
+            "channel": "News Byte",
+            "durationSeconds": 210,
+            "url": "https://www.youtube.com/watch?v=zzz999yyy88"
+          }
+        ]
+      }
+    }
+  ]
+}
+

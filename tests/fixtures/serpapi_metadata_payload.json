@@ -1,0 +1,27 @@
+{
+  "search_metadata": {
+    "status": "Success",
+    "youtube_video_url": "https://www.youtube.com/watch?v=hmtuvNfytjM"
+  },
+  "search_parameters": {
+    "engine": "youtube_video",
+    "v": "hmtuvNfytjM",
+    "hl": "en"
+  },
+  "title": "Sam Altman Shows Me GPT 5... And What's Next",
+  "channel": {
+    "name": "Cleo Abram",
+    "link": "https://www.youtube.com/@CleoAbram"
+  },
+  "views": "4,582,399 views",
+  "chapters": [
+    {
+      "title": "What future are we headed for?",
+      "time_start": 0
+    },
+    {
+      "title": "GPT-5 demo",
+      "time_start": 964
+    }
+  ]
+}

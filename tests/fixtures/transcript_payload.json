@@ -1,0 +1,87 @@
+{
+  "results": [
+    {
+      "content": [
+        {
+          "transcriptSectionHeaderRenderer": {
+            "startMs": "0",
+            "endMs": "45000",
+            "sectionHeader": {
+              "sectionHeaderViewModel": {
+                "headline": {
+                  "content": "Why podcast repurposing matters"
+                }
+              }
+            }
+          }
+        },
+        {
+          "transcriptSegmentRenderer": {
+            "startMs": "0",
+            "endMs": "9000",
+            "snippet": {
+              "runs": [
+                {
+                  "text": "Long-form podcasts contain dense ideas that deserve better discovery surfaces."
+                }
+              ]
+            }
+          }
+        },
+        {
+          "transcriptSegmentRenderer": {
+            "startMs": "9000",
+            "endMs": "21000",
+            "snippet": {
+              "runs": [
+                {
+                  "text": "Turning a conversation into an article makes the insights searchable, skimmable, and shareable."
+                }
+              ]
+            }
+          }
+        },
+        {
+          "transcriptSectionHeaderRenderer": {
+            "startMs": "45000",
+            "endMs": "80000",
+            "sectionHeader": {
+              "sectionHeaderViewModel": {
+                "headline": {
+                  "content": "How agent pipelines help"
+                }
+              }
+            }
+          }
+        },
+        {
+          "transcriptSegmentRenderer": {
+            "startMs": "45000",
+            "endMs": "61000",
+            "snippet": {
+              "runs": [
+                {
+                  "text": "An agent can fetch transcripts, identify the most meaningful moments, and group them into a narrative structure."
+                }
+              ]
+            }
+          }
+        },
+        {
+          "transcriptSegmentRenderer": {
+            "startMs": "61000",
+            "endMs": "78000",
+            "snippet": {
+              "runs": [
+                {
+                  "text": "The result should preserve source links so readers can jump back to the video whenever they need context."
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
+
