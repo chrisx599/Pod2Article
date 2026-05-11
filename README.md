@@ -156,6 +156,38 @@ Article response after completion:
 }
 ```
 
+Article output contract:
+
+- The API always returns `article_path` when an article is available.
+- `/video-deep-research/api/tasks/sync` returns both `article_path` and `article_markdown` in the same response.
+- `/video-deep-research/api/tasks/{task_id}/status` returns `article_available` and `article_path`; `article_path` is empty until the task completes.
+- `/video-deep-research/api/tasks/{task_id}/article` returns the final `article_markdown` and `article_path`.
+- API task articles are written to `output/api/<task_id>/<source-id>/articles/article-<timestamp>-<id>/article.md`.
+- Direct Agent runs write articles to `output/agent/<source-id>/articles/article-<timestamp>-<id>/article.md`.
+
+Article format:
+
+- The article is UTF-8 Markdown.
+- The Agent writes only the final Markdown article to `article.md`.
+- Source-backed claims should include clickable YouTube timestamp links, for example `https://www.youtube.com/watch?v=<id>&t=<seconds>s`.
+- The recommended structure is:
+
+```markdown
+# <article title>
+
+## Source
+
+## TL;DR
+
+## Why This Conversation Matters
+
+## Main Ideas
+
+## Key Takeaways
+
+## Source Timeline
+```
+
 API endpoints:
 
 | Method | Path | Description |
