@@ -53,6 +53,22 @@ curl -X POST http://127.0.0.1:8090/video-deep-research/api/tasks/sync \
   -d '{"question":"请总结 Sam Altman 今年以来对 AI 的核心看法，并给出视频时间戳证据"}'
 ```
 
+The synchronous endpoint blocks until the Agent finishes. A successful response includes the full article:
+
+```json
+{
+  "task_id": "20260511T020405Z-1a2b3c4d",
+  "status": "completed",
+  "research_mode": "wide",
+  "created_at": "2026-05-11T02:04:05.000000+00:00",
+  "updated_at": "2026-05-11T02:10:12.000000+00:00",
+  "article_available": true,
+  "article_path": "output/api/20260511T020405Z-1a2b3c4d/.../article.md",
+  "error_message": "",
+  "article_markdown": "# ..."
+}
+```
+
 Create a deep-search synchronous task for one known video:
 
 ```bash
@@ -67,6 +83,77 @@ Create an async task:
 curl -X POST http://127.0.0.1:8090/video-deep-research/api/tasks \
   -H 'Content-Type: application/json' \
   -d '{"question":"请总结 Sam Altman 今年以来对 AI agent、模型能力和产品方向的看法"}'
+```
+
+The async endpoint returns immediately with a task id while the Agent keeps running in the background:
+
+```json
+{
+  "task_id": "20260511T021530Z-5e6f7a8b",
+  "status": "queued",
+  "research_mode": "wide",
+  "created_at": "2026-05-11T02:15:30.000000+00:00",
+  "updated_at": "2026-05-11T02:15:30.000000+00:00",
+  "article_available": false,
+  "article_path": "",
+  "error_message": ""
+}
+```
+
+Use the returned `task_id` to poll status, stream progress events, and fetch the final article:
+
+```bash
+TASK_ID=20260511T021530Z-5e6f7a8b
+
+curl http://127.0.0.1:8090/video-deep-research/api/tasks/$TASK_ID/status
+curl http://127.0.0.1:8090/video-deep-research/api/tasks/$TASK_ID/progress
+curl http://127.0.0.1:8090/video-deep-research/api/tasks/$TASK_ID/article
+```
+
+Status response:
+
+```json
+{
+  "task_id": "20260511T021530Z-5e6f7a8b",
+  "status": "running",
+  "research_mode": "wide",
+  "created_at": "2026-05-11T02:15:30.000000+00:00",
+  "updated_at": "2026-05-11T02:16:08.000000+00:00",
+  "article_available": false,
+  "article_path": "",
+  "error_message": ""
+}
+```
+
+Progress response:
+
+```json
+{
+  "task_id": "20260511T021530Z-5e6f7a8b",
+  "status": "running",
+  "next_after_seq": 3,
+  "has_more": false,
+  "events": [
+    {
+      "seq": 1,
+      "type": "phase_started",
+      "phase": "prepare",
+      "message": "准备任务",
+      "data": {}
+    }
+  ]
+}
+```
+
+Article response after completion:
+
+```json
+{
+  "task_id": "20260511T021530Z-5e6f7a8b",
+  "status": "completed",
+  "article_markdown": "# ...",
+  "article_path": "output/api/20260511T021530Z-5e6f7a8b/.../article.md"
+}
 ```
 
 API endpoints:
@@ -107,20 +194,6 @@ python3 podcast-to-article/scripts/fetch_transcript.py "https://www.youtube.com/
 ```
 
 The transcript fetcher writes `transcripts/<slug>.transcript.json` with metadata, coverage, chapters, and full timestamped transcript segments. The codebase does not generate article drafts; agents write articles directly from this source context.
-
-## Benchmarks
-
-Run the YouTube benchmark:
-
-```bash
-python3 benchmarks/benchmark_youtube_providers.py --limit 10 --output-dir benchmark-results
-```
-
-Cache raw and normalized transcript payloads:
-
-```bash
-python3 benchmarks/cache_transcript_payloads.py iKx3gAODybU
-```
 
 ## Tests
 
