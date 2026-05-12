@@ -44,6 +44,7 @@ AGENT_ENV_PATH = Path(__file__).resolve().parent / ".env"
 SKILL_NAME = "podcast-to-article"
 MODEL_ENV_KEYS = ("CLAUDE_AGENT_MODEL", "DEFAULT_MODEL")
 LOG_ENV_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_AGENT_MODEL", "DEFAULT_MODEL", "SERPAPI_API_KEY")
+CLAUDE_CODE_AUTH_ENV_KEYS = ("ANTHROPIC_AUTH_TOKEN",)
 ProgressSink = Callable[[dict[str, object]], None]
 ARTIFACT_PROGRESS_POLL_SECONDS = 0.5
 RESEARCH_MODES = {"auto", "deep", "wide"}
@@ -237,7 +238,12 @@ def load_env_file(path: Path = AGENT_ENV_PATH) -> dict[str, str]:
         value = value.strip().strip('"').strip("'")
         if key:
             values[key] = value
-            os.environ.setdefault(key, value)
+            os.environ[key] = value
+
+    if "ANTHROPIC_API_KEY" in values:
+        for key in CLAUDE_CODE_AUTH_ENV_KEYS:
+            if key not in values:
+                os.environ.pop(key, None)
     return values
 
 

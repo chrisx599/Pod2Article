@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import unittest
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -112,6 +113,33 @@ class PodcastArticleAgentTests(unittest.TestCase):
 
         self.assertEqual(values["DEFAULT_MODEL"], "base")
         self.assertEqual(resolved, "override")
+
+    def test_load_env_file_overrides_existing_environment(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            env_path = Path(tmpdir) / ".env"
+            env_path.write_text(
+                "ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic\n"
+                "ANTHROPIC_API_KEY=deepseek-key\n"
+                "CLAUDE_AGENT_MODEL=deepseek-v4-pro\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "ANTHROPIC_AUTH_TOKEN": "stale-claude-code-token",
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                    "CLAUDE_AGENT_MODEL": "claude-sonnet",
+                },
+                clear=True,
+            ):
+                values = load_env_file(env_path)
+                resolved = resolve_model(values)
+
+                self.assertEqual(os.environ["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
+                self.assertEqual(os.environ["ANTHROPIC_API_KEY"], "deepseek-key")
+                self.assertNotIn("ANTHROPIC_AUTH_TOKEN", os.environ)
+                self.assertEqual(resolved, "deepseek-v4-pro")
 
     def test_build_run_metadata_masks_secrets(self) -> None:
         metadata = build_run_metadata(
