@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import unittest
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -65,6 +66,23 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertIn("Write the final Markdown article only to this exact path", prompt)
         self.assertIn("output/run/articles/article.md", prompt)
         self.assertIn(".transcript.json", prompt)
+
+    def test_wide_prompt_requires_derived_search_query(self) -> None:
+        question = "中国的 AI 行业大佬对当前AI发展情况的判断是怎么样的，请帮我调研"
+        prompt = build_prompt(
+            input_value=question,
+            question=question,
+            workspace_dir="output/run/workspace",
+            search_dir="output/run/search-results",
+            transcript_dir="output/run/transcripts",
+            article_path="output/run/articles/article.md",
+            research_mode="wide",
+        )
+
+        self.assertIn("Derive a concise YouTube search query", prompt)
+        self.assertIn('search_youtube.py "<derived-search-query>"', prompt)
+        self.assertIn("search_query: <derived search query>", prompt)
+        self.assertNotIn(f"search_youtube.py {shlex.quote(question)}", prompt)
 
     def test_build_article_dir_adds_uuid_suffix(self) -> None:
         fixed_now = datetime(2026, 5, 10, 12, 30, tzinfo=timezone.utc)

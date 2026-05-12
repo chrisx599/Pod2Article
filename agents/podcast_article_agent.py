@@ -122,10 +122,6 @@ def build_prompt(
         "python3 podcast-to-article/scripts/fetch_transcript.py "
         f"{shlex.quote(input_value)} --output-dir {shlex.quote(transcript_dir)}"
     )
-    search_command = (
-        "python3 podcast-to-article/scripts/search_youtube.py "
-        f"{shlex.quote(input_value)} --output-dir {shlex.quote(search_dir)}"
-    )
     if research_mode == "wide":
         return f"""Use the {SKILL_NAME} skill to produce a grounded wide video deep research article.
 
@@ -148,15 +144,20 @@ Write the final Markdown article only to this exact path:
 {article_path}
 
 Required wide-search workflow:
-1. Run the bundled YouTube search tool from the repository root:
-   {search_command}
-2. Open the generated `.search.json`, inspect the ranked candidates, and choose 3-5 relevant videos when available. Prefer substantive interviews, talks, or podcast episodes over short clips.
-3. For each selected video, run the bundled transcript fetcher with the video URL:
+1. Derive a concise YouTube search query from the research topic before running any search tool. Do not use the full user request verbatim unless it is already a compact search phrase.
+   - Prefer concrete entities, domain terms, and source formats such as interview, podcast, talk, panel, or keynote.
+   - Remove task wording such as "please research", "write an article", "summarize", or "help me".
+   - Add a year, region, person, company, or product name only when the research topic supports it.
+   - For Chinese topics, use the most likely YouTube-discoverable query. Include English terms such as AI, AGI, LLM, agent, interview, or podcast when they materially improve recall.
+2. Run the bundled YouTube search tool from the repository root with the derived query:
+   python3 podcast-to-article/scripts/search_youtube.py "<derived-search-query>" --output-dir {shlex.quote(search_dir)}
+3. Open the generated `.search.json`, inspect the ranked candidates, and choose 3-5 relevant videos when available. Prefer substantive interviews, talks, or podcast episodes over short clips.
+4. For each selected video, run the bundled transcript fetcher with the video URL:
    python3 podcast-to-article/scripts/fetch_transcript.py "<selected-video-url>" --output-dir {shlex.quote(transcript_dir)}
-4. Open and read every generated `.transcript.json` file before drafting.
-5. Synthesize across the gathered transcripts. Compare recurring claims, changes over time, disagreements, and caveats when the source material supports them.
-6. Write a coherent Markdown article that answers the research topic and includes clickable YouTube timestamp links.
-7. Do not create article drafts in any other directory. Do not expose hidden reasoning.
+5. Open and read every generated `.transcript.json` file before drafting.
+6. Synthesize across the gathered transcripts. Compare recurring claims, changes over time, disagreements, and caveats when the source material supports them.
+7. Write a coherent Markdown article that answers the research topic and includes clickable YouTube timestamp links.
+8. Do not create article drafts in any other directory. Do not expose hidden reasoning.
 
 Required outputs:
 - one `.search.json` file under {search_dir}
@@ -166,6 +167,7 @@ Required outputs:
 If only one relevant transcript can be acquired, write the article from that transcript and state the coverage limitation in the article.
 
 At the end, print:
+search_query: <derived search query>
 search: <path to generated search json>
 transcripts: <paths to generated transcript json files>
 article: {article_path}
