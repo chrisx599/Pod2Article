@@ -61,7 +61,32 @@ class YouTubeSourcesTestCase(unittest.TestCase):
             payload = json.loads(destination.read_text(encoding="utf-8"))
             self.assertTrue(destination.name.endswith(".search.json"))
             self.assertEqual(payload["query"], "ai podcast agents")
+            self.assertIn("query_hash", payload)
             self.assertEqual(payload["candidates"][0]["video_id"], "abc123def45")
+
+    def test_search_youtube_context_preserves_colliding_query_slugs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            first = search_youtube_context(
+                "中国 AI 领袖 访谈 人工智能 发展 2025",
+                output_dir=output_dir,
+                client=FakeClient(self._fixtures()),
+            )
+            second = search_youtube_context(
+                "李开复 周鸿祎 王小川 AI 访谈 2025",
+                output_dir=output_dir,
+                client=FakeClient(self._fixtures()),
+            )
+            third = search_youtube_context(
+                "李开复 周鸿祎 王小川 AI 访谈 2025",
+                output_dir=output_dir,
+                client=FakeClient(self._fixtures()),
+            )
+
+            self.assertNotEqual(first.name, second.name)
+            self.assertNotEqual(second.name, third.name)
+            self.assertEqual(len(list(output_dir.glob("*.search.json"))), 3)
+            self.assertTrue(third.stem.endswith("-2.search") or third.name.endswith("-2.search.json"))
 
     def test_fetch_transcript_context_writes_complete_source_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

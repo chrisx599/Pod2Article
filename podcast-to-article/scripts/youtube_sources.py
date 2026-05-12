@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ else:
 SCRIPT_DIR = Path(__file__).resolve().parent
 CODE_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = CODE_ROOT.parent
+SEARCH_QUERY_HASH_LENGTH = 8
 
 
 @dataclass
@@ -270,13 +272,15 @@ def search_youtube_context(
     payload = runtime_client.search(query)
     candidates = search_candidates(payload, query)
     output_dir.mkdir(parents=True, exist_ok=True)
-    destination = output_dir / f"{slugify(query, fallback='youtube-search')}.search.json"
+    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:SEARCH_QUERY_HASH_LENGTH]
+    destination = unique_search_output_path(query, output_dir=output_dir, query_hash=query_hash)
     destination.write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "query": query,
+                "query_hash": query_hash,
                 "provider": "serpapi",
                 "candidates": [candidate.__dict__ for candidate in candidates],
             },
@@ -286,6 +290,19 @@ def search_youtube_context(
         encoding="utf-8",
     )
     return destination
+
+
+def unique_search_output_path(query: str, *, output_dir: Path, query_hash: str) -> Path:
+    stem = f"{slugify(query, fallback='youtube-search')}-{query_hash}"
+    candidate = output_dir / f"{stem}.search.json"
+    if not candidate.exists():
+        return candidate
+    index = 2
+    while True:
+        candidate = output_dir / f"{stem}-{index}.search.json"
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def _segment_end_sec(segment: Segment) -> int:
