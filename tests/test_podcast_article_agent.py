@@ -79,9 +79,13 @@ class PodcastArticleAgentTests(unittest.TestCase):
             research_mode="wide",
         )
 
-        self.assertIn("Derive a concise YouTube search query", prompt)
+        self.assertIn("Derive 2-3 concise, complementary YouTube search queries", prompt)
         self.assertIn('search_youtube.py "<derived-search-query>"', prompt)
-        self.assertIn("search_query: <derived search query>", prompt)
+        self.assertIn("Enforce source diversity", prompt)
+        self.assertIn("Do not count third-party media analysis", prompt)
+        self.assertIn("Avoid broad English queries", prompt)
+        self.assertIn("Do not let one long transcript dominate", prompt)
+        self.assertIn("search_queries: <derived search queries>", prompt)
         self.assertNotIn(f"search_youtube.py {shlex.quote(question)}", prompt)
 
     def test_build_article_dir_adds_uuid_suffix(self) -> None:

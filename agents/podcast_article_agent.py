@@ -144,31 +144,39 @@ Write the final Markdown article only to this exact path:
 {article_path}
 
 Required wide-search workflow:
-1. Derive a concise YouTube search query from the research topic before running any search tool. Do not use the full user request verbatim unless it is already a compact search phrase.
+1. Derive 2-3 concise, complementary YouTube search queries from the research topic before running any search tool. Do not use the full user request verbatim unless it is already a compact search phrase.
    - Prefer concrete entities, domain terms, and source formats such as interview, podcast, talk, panel, or keynote.
    - Remove task wording such as "please research", "write an article", "summarize", or "help me".
    - Add a year, region, person, company, or product name only when the research topic supports it.
    - For Chinese topics, use the most likely YouTube-discoverable query. Include English terms such as AI, AGI, LLM, agent, interview, or podcast when they materially improve recall.
-2. Run the bundled YouTube search tool from the repository root with the derived query:
+   - Use one primary precise query and one broader/source-format query. Add a bilingual or English query only when it is likely to improve YouTube recall.
+   - If the topic asks about a broad group such as industry leaders, founders, investors, researchers, or companies, do not anchor all queries on one prominent person. Spread queries across roles, organizations, and viewpoints unless the user named a specific person.
+   - If the user asks for Chinese industry leaders or Chinese companies, the main queries must target direct Chinese sources: Chinese-language interviews, talks, panels, keynotes, and founder/executive names or company names. Avoid broad English queries such as "China AI race", "China AI founder podcast", or "China AI analysis" unless they include a specific Chinese speaker or company.
+2. Run the bundled YouTube search tool from the repository root for each derived query:
    python3 podcast-to-article/scripts/search_youtube.py "<derived-search-query>" --output-dir {shlex.quote(search_dir)}
-3. Open the generated `.search.json`, inspect the ranked candidates, and choose 3-5 relevant videos when available. Prefer substantive interviews, talks, or podcast episodes over short clips.
-4. For each selected video, run the bundled transcript fetcher with the video URL:
+3. Open every generated `.search.json`, merge candidates by video_id, inspect the ranked candidates, and choose 3-5 relevant videos when available. Prefer substantive interviews, talks, panels, keynotes, or podcast episodes over short clips, reactions, trailers, and news snippets.
+   - Enforce source diversity when the topic is broad: prefer different speakers, channels, organizations, roles, and perspectives over multiple videos centered on the same person or event.
+   - If the best usable candidates are skewed toward one person, run one additional broader query before drafting to fill the missing coverage.
+   - For a question about what a group of people thinks, selected main sources must be first-person or event sources from that group: the leader speaking, being interviewed, joining a panel, or giving a talk. Do not count third-party media analysis, news explainers, or foreign podcasts discussing China as "industry leader" coverage.
+   - Use third-party analysis only as background context and at most one supporting source. If fewer than two direct in-scope transcripts are available, continue searching with named Chinese speakers/companies before drafting.
+4. For each selected video, run the bundled transcript fetcher with the video URL. If a selected candidate has no transcript/subtitles, skip it and continue down the ranked list until you have up to 3-5 usable transcript files or all relevant candidates are exhausted:
    python3 podcast-to-article/scripts/fetch_transcript.py "<selected-video-url>" --output-dir {shlex.quote(transcript_dir)}
 5. Open and read every generated `.transcript.json` file before drafting.
-6. Synthesize across the gathered transcripts. Compare recurring claims, changes over time, disagreements, and caveats when the source material supports them.
-7. Write a coherent Markdown article that answers the research topic and includes clickable YouTube timestamp links.
-8. Do not create article drafts in any other directory. Do not expose hidden reasoning.
+6. Create source coverage notes before drafting: for each transcript, identify the speaker/channel, role, whether it is direct first-person evidence or third-party analysis, main claims, and where it adds a distinct perspective. Use every usable in-scope direct transcript in the synthesis unless it is clearly off-topic; if a transcript is excluded, state the exclusion reason in the article.
+7. Synthesize across the gathered transcripts. Compare recurring claims, changes over time, disagreements, and caveats when the source material supports them. Do not let one long transcript dominate a broad-topic article when other usable transcripts are available.
+8. Write a coherent Markdown article that answers the research topic and includes clickable YouTube timestamp links. For broad-topic articles, the title, introduction, and conclusion must reflect the actual source breadth; do not frame the article as one person's view unless only one usable transcript was acquired. If the gathered evidence is mostly third-party analysis rather than the requested group's direct statements, narrow the title and introduction to that limitation instead of presenting it as the group's collective view.
+9. Do not create article drafts in any other directory. Do not expose hidden reasoning.
 
 Required outputs:
-- one `.search.json` file under {search_dir}
+- one or more `.search.json` files under {search_dir}
 - one or more `.transcript.json` files under {transcript_dir}
 - {article_path}
 
 If only one relevant transcript can be acquired, write the article from that transcript and state the coverage limitation in the article.
 
 At the end, print:
-search_query: <derived search query>
-search: <path to generated search json>
+search_queries: <derived search queries>
+search: <paths to generated search json files>
 transcripts: <paths to generated transcript json files>
 article: {article_path}
 """

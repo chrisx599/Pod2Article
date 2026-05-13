@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +27,146 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CODE_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = CODE_ROOT.parent
 SEARCH_QUERY_HASH_LENGTH = 8
+LATIN_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "was",
+    "were",
+    "will",
+    "with",
+}
+PREFERRED_SOURCE_TERMS = {
+    "conversation",
+    "discussion",
+    "fireside",
+    "interview",
+    "keynote",
+    "lecture",
+    "panel",
+    "podcast",
+    "talk",
+    "对谈",
+    "访谈",
+    "采访",
+    "播客",
+    "演讲",
+    "圆桌",
+    "专访",
+}
+NOISY_SOURCE_TERMS = {
+    "clip",
+    "clips",
+    "highlight",
+    "highlights",
+    "reaction",
+    "reacts",
+    "short",
+    "shorts",
+    "teaser",
+    "trailer",
+}
+DIRECT_SOURCE_TERMS = {
+    "conversation",
+    "dialogue",
+    "interview",
+    "keynote",
+    "speech",
+    "talk",
+    "with",
+    "对话",
+    "访谈",
+    "采访",
+    "演讲",
+    "专访",
+}
+THIRD_PARTY_ANALYSIS_TERMS = {
+    "analysis",
+    "analyst",
+    "battle",
+    "breakthrough",
+    "documentary",
+    "explained",
+    "explains",
+    "race",
+    "rivalry",
+    "war",
+    "winning",
+    "解读",
+    "分析",
+    "纪录片",
+    "赶超",
+    "竞争",
+}
+CHINA_TOPIC_TERMS = {"china", "chinese", "中国", "国产", "华人"}
+LEADER_TOPIC_TERMS = {
+    "boss",
+    "ceo",
+    "entrepreneur",
+    "founder",
+    "leader",
+    "leaders",
+    "大佬",
+    "企业家",
+    "创始人",
+    "领袖",
+}
+CHINESE_LEADER_SIGNAL_TERMS = {
+    "01",
+    "alibaba",
+    "baichuan",
+    "baidu",
+    "bytedance",
+    "deepseek",
+    "huawei",
+    "kimi",
+    "minimax",
+    "moonshot",
+    "qwen",
+    "sensetime",
+    "tencent",
+    "tsai",
+    "wang",
+    "xiaochuan",
+    "zhipu",
+    "zhang",
+    "阿里",
+    "百度",
+    "百川",
+    "蔡崇信",
+    "大模型",
+    "华为",
+    "李开复",
+    "梁建章",
+    "梁文锋",
+    "零一",
+    "商汤",
+    "深度求索",
+    "腾讯",
+    "王小川",
+    "月之暗面",
+    "张亚勤",
+    "智谱",
+    "周鸿祎",
+    "字节",
+}
 
 
 @dataclass
@@ -37,6 +179,9 @@ class VideoCandidate:
     score: float
     transcript_available: bool
     subtitles_available: bool
+    views: Optional[int] = None
+    published_date: Optional[str] = None
+    description: Optional[str] = None
 
 
 @dataclass
@@ -174,8 +319,141 @@ def _channel_name(value: Any) -> Optional[str]:
     return None
 
 
+def _text(value: Any) -> str:
+    nested = _nested_text(value)
+    if nested is not None:
+        return nested
+    if isinstance(value, (int, float)):
+        return str(value)
+    return str(value).strip() if isinstance(value, str) else ""
+
+
+def _search_tokens(value: str) -> set[str]:
+    tokens: set[str] = set()
+    for match in re.finditer(r"[a-z0-9]+|[\u3400-\u9fff]+", value.lower()):
+        text = match.group(0)
+        if re.fullmatch(r"[a-z0-9]+", text):
+            if len(text) > 1 and text not in LATIN_STOPWORDS:
+                tokens.add(text)
+            continue
+        if len(text) <= 4:
+            tokens.add(text)
+        for size in (2, 3, 4):
+            if len(text) >= size:
+                tokens.update(text[index : index + size] for index in range(len(text) - size + 1))
+    return tokens
+
+
+def _term_overlap_score(query_terms: set[str], value: str, weight: float) -> float:
+    if not query_terms or not value:
+        return 0.0
+    return len(query_terms & _search_tokens(value)) * weight
+
+
+def _parse_views(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+
+    stripped = value.strip().lower().replace(",", "")
+    multiplier = 1.0
+    if "亿" in stripped:
+        multiplier = 100_000_000.0
+    elif "万" in stripped:
+        multiplier = 10_000.0
+    elif "b" in stripped:
+        multiplier = 1_000_000_000.0
+    elif "m" in stripped:
+        multiplier = 1_000_000.0
+    elif "k" in stripped:
+        multiplier = 1_000.0
+
+    match = re.search(r"(\d+(?:\.\d+)?)", stripped)
+    return int(float(match.group(1)) * multiplier) if match else None
+
+
+def _views_bonus(views: Optional[int]) -> float:
+    if not views or views <= 0:
+        return 0.0
+    return min(math.log10(views + 1) * 0.22, 1.5)
+
+
+def _duration_bonus(duration_sec: Optional[int]) -> float:
+    if duration_sec is None:
+        return 0.0
+    if duration_sec < 180:
+        return -1.6
+    if duration_sec < 600:
+        return -0.7
+    if duration_sec <= 7200:
+        return min(duration_sec / 3600.0, 1.6)
+    return 0.9
+
+
+def _source_format_bonus(title: str, description: str, query_terms: set[str]) -> float:
+    searchable = f"{title} {description}".lower()
+    terms = _search_tokens(searchable)
+    bonus = 0.8 if terms & PREFERRED_SOURCE_TERMS else 0.0
+    noisy_terms = terms & NOISY_SOURCE_TERMS
+    if noisy_terms and not noisy_terms & query_terms:
+        bonus -= 1.2
+    return bonus
+
+
+def _direct_leader_source_bonus(title: str, channel: str, description: str, query_terms: set[str]) -> float:
+    terms = _search_tokens(f"{title} {channel} {description}")
+    direct_query_terms = LEADER_TOPIC_TERMS | DIRECT_SOURCE_TERMS | PREFERRED_SOURCE_TERMS
+    if not query_terms & CHINA_TOPIC_TERMS or not query_terms & direct_query_terms:
+        return 0.0
+
+    bonus = 0.0
+    leader_signal = terms & CHINESE_LEADER_SIGNAL_TERMS
+    if terms & DIRECT_SOURCE_TERMS:
+        bonus += 1.4
+    if leader_signal:
+        bonus += 1.2
+    if terms & LEADER_TOPIC_TERMS:
+        bonus += 0.8
+
+    third_party_terms = terms & THIRD_PARTY_ANALYSIS_TERMS
+    if not leader_signal and not terms & DIRECT_SOURCE_TERMS and not terms & LEADER_TOPIC_TERMS:
+        bonus -= 1.0
+    if third_party_terms and not terms & DIRECT_SOURCE_TERMS and not leader_signal:
+        bonus -= 2.2
+    if third_party_terms and not terms & LEADER_TOPIC_TERMS and not leader_signal:
+        bonus -= 0.8
+    return bonus
+
+
+def _candidate_score(
+    *,
+    query_terms: set[str],
+    title: str,
+    channel: str,
+    description: str,
+    duration_sec: Optional[int],
+    views: Optional[int],
+    position: Any,
+) -> float:
+    position_bonus = max(0.0, (10.0 - float(position)) * 0.15) if isinstance(position, (int, float)) else 0.0
+    score = position_bonus
+    score += _term_overlap_score(query_terms, title, 2.0)
+    score += _term_overlap_score(query_terms, channel, 2.3)
+    score += _term_overlap_score(query_terms, description, 0.55)
+    score += _duration_bonus(duration_sec)
+    score += _views_bonus(views)
+    score += _source_format_bonus(title, description, query_terms)
+    score += _direct_leader_source_bonus(title, channel, description, query_terms)
+    return round(score, 4)
+
+
 def search_candidates(payload: dict[str, Any], query: str) -> list[VideoCandidate]:
-    query_terms = {token for token in slugify(query).split("-") if token}
+    query_terms = _search_tokens(query)
     candidates: list[VideoCandidate] = []
     for fallback_position, item in enumerate(_flatten_search_items(payload), start=1):
         navigation = item.get("navigationEndpoint", {})
@@ -185,7 +463,7 @@ def search_candidates(payload: dict[str, Any], query: str) -> list[VideoCandidat
             video_id = extract_video_id(item["link"])
         if not video_id:
             continue
-        title = _nested_text(item.get("title")) or item.get("name") or f"Video {video_id}"
+        title = _nested_text(item.get("title")) or _text(item.get("name")) or f"Video {video_id}"
         channel = (
             _channel_name(item.get("channel"))
             or _channel_name(item.get("uploader"))
@@ -194,13 +472,12 @@ def search_candidates(payload: dict[str, Any], query: str) -> list[VideoCandidat
             or _nested_text(item.get("longBylineText"))
             or "Unknown channel"
         )
+        description = _text(item.get("description")) or _text(item.get("snippet"))
         duration_sec = parse_duration_seconds(
             item.get("durationSeconds") or item.get("duration") or item.get("length") or _nested_text(item.get("lengthText"))
         )
-        title_terms = {token for token in slugify(title).split("-") if token}
-        channel_terms = {token for token in slugify(channel).split("-") if token}
         position = item.get("position_on_page") or fallback_position
-        position_bonus = max(0.0, (10.0 - float(position)) * 0.15) if isinstance(position, (int, float)) else 0.0
+        views = _parse_views(item.get("views") or item.get("views_count") or item.get("view_count"))
         candidates.append(
             VideoCandidate(
                 video_id=video_id,
@@ -208,9 +485,20 @@ def search_candidates(payload: dict[str, Any], query: str) -> list[VideoCandidat
                 channel=channel,
                 url=item.get("url") or item.get("link") or f"https://www.youtube.com/watch?v={video_id}",
                 duration_sec=duration_sec,
-                score=len(query_terms & title_terms) * 1.5 + len(query_terms & channel_terms) * 2.5 + min((duration_sec or 0) / 3600.0, 2.0) + position_bonus,
+                score=_candidate_score(
+                    query_terms=query_terms,
+                    title=title,
+                    channel=channel,
+                    description=description,
+                    duration_sec=duration_sec,
+                    views=views,
+                    position=position,
+                ),
                 transcript_available=False,
                 subtitles_available=False,
+                views=views,
+                published_date=_text(item.get("published_date") or item.get("published_time")),
+                description=description,
             )
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)

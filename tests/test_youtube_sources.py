@@ -116,6 +116,89 @@ class YouTubeSourcesTestCase(unittest.TestCase):
         self.assertEqual(candidates[0].url, "https://www.youtube.com/watch?v=hmtuvNfytjM")
         self.assertEqual(candidates[0].duration_sec, 3907)
 
+    def test_search_candidates_rank_chinese_entity_matches_over_position(self) -> None:
+        payload = {
+            "video_results": [
+                {
+                    "position_on_page": 1,
+                    "title": "科技新闻三分钟",
+                    "link": "https://www.youtube.com/watch?v=news1234567",
+                    "video_id": "news1234567",
+                    "channel": {"name": "News Byte"},
+                    "length": "2:30",
+                    "views": "10万次观看",
+                },
+                {
+                    "position_on_page": 2,
+                    "title": "李开复 对谈 王小川：中国 AI 发展与大模型创业",
+                    "link": "https://www.youtube.com/watch?v=deep1234567",
+                    "video_id": "deep1234567",
+                    "channel": {"name": "AI 访谈"},
+                    "length": "1:12:00",
+                    "views": "5万次观看",
+                    "description": "人工智能 发展 访谈",
+                },
+            ]
+        }
+        candidates = search_candidates(payload, "李开复 王小川 AI 访谈 人工智能 发展")
+        self.assertEqual(candidates[0].video_id, "deep1234567")
+        self.assertGreater(candidates[0].score, candidates[1].score)
+
+    def test_search_candidates_penalize_reaction_noise_when_original_is_available(self) -> None:
+        payload = {
+            "video_results": [
+                {
+                    "position_on_page": 1,
+                    "title": "Sam Altman GPT-5 Podcast Reaction Clip",
+                    "link": "https://www.youtube.com/watch?v=react123456",
+                    "video_id": "react123456",
+                    "channel": {"name": "Reaction Lab"},
+                    "length": "4:00",
+                    "views": "100K views",
+                },
+                {
+                    "position_on_page": 2,
+                    "title": "Sam Altman on GPT-5 and the Future of AI",
+                    "link": "https://www.youtube.com/watch?v=orig1234567",
+                    "video_id": "orig1234567",
+                    "channel": {"name": "Cleo Abram"},
+                    "length": "1:05:00",
+                    "views": "4.5M views",
+                    "description": "Full interview with Sam Altman about GPT-5.",
+                },
+            ]
+        }
+        candidates = search_candidates(payload, "Sam Altman GPT 5 interview")
+        self.assertEqual(candidates[0].video_id, "orig1234567")
+
+    def test_search_candidates_prefer_direct_chinese_leader_sources_over_analysis(self) -> None:
+        payload = {
+            "video_results": [
+                {
+                    "position_on_page": 1,
+                    "title": "Is China Winning the A.I. Race?",
+                    "link": "https://www.youtube.com/watch?v=analysis123",
+                    "video_id": "analysis123",
+                    "channel": {"name": "New York Times Podcasts"},
+                    "length": "29:42",
+                    "views": "200K views",
+                    "description": "A news analysis about China's AI race.",
+                },
+                {
+                    "position_on_page": 2,
+                    "title": "Alibaba's Joe Tsai on China's AI Future",
+                    "link": "https://www.youtube.com/watch?v=direct12345",
+                    "video_id": "direct12345",
+                    "channel": {"name": "All-In Podcast"},
+                    "length": "27:07",
+                    "views": "100K views",
+                    "description": "Interview with Alibaba chair Joe Tsai.",
+                },
+            ]
+        }
+        candidates = search_candidates(payload, "China AI founder podcast 2025")
+        self.assertEqual(candidates[0].video_id, "direct12345")
+
     def test_parse_metadata_supports_serpapi_video_payload(self) -> None:
         payload = self._fixture("serpapi_metadata_payload.json")
         parsed = parse_metadata(payload, "hmtuvNfytjM")
