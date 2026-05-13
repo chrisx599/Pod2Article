@@ -56,13 +56,27 @@ class YouTubeSourcesTestCase(unittest.TestCase):
             destination = search_youtube_context(
                 "ai podcast agents",
                 output_dir=Path(tmpdir),
+                run_id="article-1",
                 client=FakeClient(self._fixtures()),
             )
             payload = json.loads(destination.read_text(encoding="utf-8"))
             self.assertTrue(destination.name.endswith(".search.json"))
+            self.assertEqual(payload["run_id"], "article-1")
             self.assertEqual(payload["query"], "ai podcast agents")
+            self.assertEqual(payload["canonical_query"], "ai podcast agents")
             self.assertIn("query_hash", payload)
+            raw_path = Path(payload["raw_output_path"])
+            raw_payload = json.loads(raw_path.read_text(encoding="utf-8"))
+            self.assertTrue(raw_path.name.endswith(".raw-search.json"))
+            self.assertEqual(raw_payload["run_id"], "article-1")
+            self.assertIn("payload", raw_payload)
             self.assertEqual(payload["candidates"][0]["video_id"], "abc123def45")
+            manifest = json.loads((Path(tmpdir) / "search-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["search_count"], 1)
+            self.assertEqual(manifest["searches"][0]["round"], 1)
+            self.assertEqual(manifest["searches"][0]["run_id"], "article-1")
+            self.assertEqual(manifest["searches"][0]["output_path"], str(destination))
+            self.assertEqual(manifest["searches"][0]["raw_output_path"], str(raw_path))
 
     def test_search_youtube_context_preserves_colliding_query_slugs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -86,17 +100,22 @@ class YouTubeSourcesTestCase(unittest.TestCase):
             self.assertNotEqual(first.name, second.name)
             self.assertNotEqual(second.name, third.name)
             self.assertEqual(len(list(output_dir.glob("*.search.json"))), 3)
-            self.assertTrue(third.stem.endswith("-2.search") or third.name.endswith("-2.search.json"))
+            self.assertTrue(third.name.endswith("-2.search.json"))
+            manifest = json.loads((output_dir / "search-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["search_count"], 3)
+            self.assertEqual([item["round"] for item in manifest["searches"]], [1, 2, 3])
 
     def test_fetch_transcript_context_writes_complete_source_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = fetch_transcript_context(
                 "https://www.youtube.com/watch?v=abc123def45",
                 output_dir=Path(tmpdir),
+                run_id="article-1",
                 client=FakeClient(self._fixtures()),
             )
             payload = json.loads(destination.read_text(encoding="utf-8"))
             self.assertTrue(destination.name.endswith(".transcript.json"))
+            self.assertEqual(payload["run_id"], "article-1")
             self.assertEqual(payload["video"]["video_id"], "abc123def45")
             self.assertEqual(payload["coverage"]["segments_count"], len(payload["segments"]))
             self.assertGreater(payload["coverage"]["words_count"], 0)

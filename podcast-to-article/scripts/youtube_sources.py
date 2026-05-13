@@ -27,6 +27,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CODE_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = CODE_ROOT.parent
 SEARCH_QUERY_HASH_LENGTH = 8
+SEARCH_MANIFEST_FILENAME = "search-manifest.json"
 LATIN_STOPWORDS = {
     "a",
     "an",
@@ -285,7 +286,7 @@ def _flatten_search_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(content, str):
         try:
             decoded = json.loads(content)
-        except json.JSONDecodeError:
+        except (OSError, json.JSONDecodeError):
             return []
         return [item for item in decoded if isinstance(item, dict)]
     if isinstance(content, dict) and isinstance(content.get("results"), list):
@@ -554,22 +555,46 @@ def search_youtube_context(
     query: str,
     *,
     output_dir: Path,
+    run_id: str | None = None,
     client: Optional[Any] = None,
 ) -> Path:
     runtime_client = build_runtime_client(client, Path.cwd())
     payload = runtime_client.search(query)
     candidates = search_candidates(payload, query)
     output_dir.mkdir(parents=True, exist_ok=True)
-    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:SEARCH_QUERY_HASH_LENGTH]
-    destination = unique_search_output_path(query, output_dir=output_dir, query_hash=query_hash)
+    canonical_query = canonicalize_search_query(query)
+    query_hash = hashlib.sha256(canonical_query.encode("utf-8")).hexdigest()[:SEARCH_QUERY_HASH_LENGTH]
+    destination = unique_search_output_path(canonical_query, output_dir=output_dir, query_hash=query_hash)
+    raw_destination = raw_search_output_path(destination)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    raw_destination.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": generated_at,
+                "run_id": run_id,
+                "query": query,
+                "canonical_query": canonical_query,
+                "query_hash": query_hash,
+                "provider": "serpapi",
+                "payload": payload,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     destination.write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "generated_at": generated_at,
+                "run_id": run_id,
                 "query": query,
+                "canonical_query": canonical_query,
                 "query_hash": query_hash,
                 "provider": "serpapi",
+                "raw_output_path": str(raw_destination),
                 "candidates": [candidate.__dict__ for candidate in candidates],
             },
             ensure_ascii=False,
@@ -577,7 +602,26 @@ def search_youtube_context(
         ),
         encoding="utf-8",
     )
+    append_search_manifest(
+        output_dir,
+        {
+            "created_at": generated_at,
+            "run_id": run_id,
+            "query": query,
+            "canonical_query": canonical_query,
+            "query_hash": query_hash,
+            "provider": "serpapi",
+            "output_path": str(destination),
+            "raw_output_path": str(raw_destination),
+            "candidate_count": len(candidates),
+            "top_video_ids": [candidate.video_id for candidate in candidates[:5]],
+        },
+    )
     return destination
+
+
+def canonicalize_search_query(query: str) -> str:
+    return re.sub(r"\s+", " ", query.strip()).casefold()
 
 
 def unique_search_output_path(query: str, *, output_dir: Path, query_hash: str) -> Path:
@@ -591,6 +635,45 @@ def unique_search_output_path(query: str, *, output_dir: Path, query_hash: str) 
         if not candidate.exists():
             return candidate
         index += 1
+
+
+def raw_search_output_path(search_output_path: Path) -> Path:
+    name = search_output_path.name
+    if name.endswith(".search.json"):
+        return search_output_path.with_name(f"{name.removesuffix('.search.json')}.raw-search.json")
+    return search_output_path.with_suffix(".raw-search.json")
+
+
+def append_search_manifest(output_dir: Path, entry: dict[str, Any]) -> Path:
+    manifest_path = output_dir / SEARCH_MANIFEST_FILENAME
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        if not isinstance(manifest, dict):
+            manifest = {}
+    else:
+        manifest = {}
+
+    searches = manifest.get("searches")
+    if not isinstance(searches, list):
+        searches = []
+
+    now = datetime.now(timezone.utc).isoformat()
+    searches.append({"round": len(searches) + 1, **entry})
+    manifest.update(
+        {
+            "schema_version": 1,
+            "generated_at": manifest.get("generated_at") or now,
+            "updated_at": now,
+            "search_dir": str(output_dir),
+            "search_count": len(searches),
+            "searches": searches,
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest_path
 
 
 def _segment_end_sec(segment: Segment) -> int:
@@ -674,6 +757,7 @@ def fetch_transcript_context(
     output_dir: Path,
     language_code: str = "en",
     search_limit: int = 5,
+    run_id: str | None = None,
     client: Optional[Any] = None,
 ) -> Path:
     runtime_client = build_runtime_client(client, Path.cwd())
@@ -698,6 +782,7 @@ def fetch_transcript_context(
     payload = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
         "input": raw_input,
         "provider": "serpapi",
         "source_kind": resolved.source_kind,

@@ -26,6 +26,8 @@ from agents.podcast_article_agent import (
     resolve_model,
     run_agent,
     serialize_message,
+    write_run_manifest,
+    write_sources_manifest,
 )
 
 
@@ -76,15 +78,18 @@ class PodcastArticleAgentTests(unittest.TestCase):
             search_dir="output/run/search-results",
             transcript_dir="output/run/transcripts",
             article_path="output/run/articles/article.md",
+            run_id="article-20260510T123000Z-abcdef12",
             research_mode="wide",
         )
 
         self.assertIn("Derive 2-3 concise, complementary YouTube search queries", prompt)
         self.assertIn('search_youtube.py "<derived-search-query>"', prompt)
+        self.assertIn("--run-id article-20260510T123000Z-abcdef12", prompt)
         self.assertIn("Enforce source diversity", prompt)
         self.assertIn("Do not count third-party media analysis", prompt)
         self.assertIn("Avoid broad English queries", prompt)
         self.assertIn("Do not let one long transcript dominate", prompt)
+        self.assertIn("Open `search-manifest.json`", prompt)
         self.assertIn("search_queries: <derived search queries>", prompt)
         self.assertNotIn(f"search_youtube.py {shlex.quote(question)}", prompt)
 
@@ -175,6 +180,36 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(metadata["env"]["SERPAPI_API_KEY"], "<set>")
         self.assertNotIn("secret-value", str(metadata))
 
+    def test_write_run_manifest_resets_created_at_for_new_run_id(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = build_workspace_paths(root, "demo")
+            manifest_path = paths["workspace_dir"] / "run-manifest.json"
+            article_path = paths["articles_root"] / "article-new" / "article.md"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps({"run_id": "old-run", "created_at": "2026-01-01T00:00:00+00:00"}),
+                encoding="utf-8",
+            )
+
+            write_run_manifest(
+                manifest_path,
+                status="running",
+                input_value="demo",
+                question="写文章",
+                source_id="demo",
+                research_mode="deep",
+                model="model",
+                paths=paths,
+                article_path=article_path,
+                run_id="new-run",
+            )
+
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["run_id"], "new-run")
+        self.assertNotEqual(payload["created_at"], "2026-01-01T00:00:00+00:00")
+
     def test_serialize_message_masks_secret_tool_input(self) -> None:
         message = FakeMessage(
             content=[
@@ -202,15 +237,79 @@ class PodcastArticleAgentTests(unittest.TestCase):
 
             self.assertEqual(find_transcript_context(transcript_dir), ready)
 
+    def test_write_sources_manifest_filters_by_run_id(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            search_dir = root / "search-results"
+            transcript_dir = root / "transcripts"
+            search_dir.mkdir()
+            transcript_dir.mkdir()
+            (search_dir / "old.search.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "old-run",
+                        "query": "old query",
+                        "candidates": [{"video_id": "old12345678", "title": "Old"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (search_dir / "new.search.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "new-run",
+                        "query": "new query",
+                        "candidates": [{"video_id": "new12345678", "title": "New", "score": 2.0}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (transcript_dir / "old.transcript.json").write_text(
+                json.dumps({"run_id": "old-run", "video": {"video_id": "old12345678"}}),
+                encoding="utf-8",
+            )
+            (transcript_dir / "new.transcript.json").write_text(
+                json.dumps({"run_id": "new-run", "video": {"video_id": "new12345678"}, "coverage": {"segments_count": 1}}),
+                encoding="utf-8",
+            )
+            article_path = root / "article.md"
+            article_path.write_text("[`00:00`](https://www.youtube.com/watch?v=new12345678&t=0s)", encoding="utf-8")
+
+            manifest = write_sources_manifest(
+                root / "sources-manifest.json",
+                search_dir=search_dir,
+                transcript_dir=transcript_dir,
+                article_path=article_path,
+                run_id="new-run",
+            )
+
+        self.assertEqual(manifest["search_count"], 1)
+        self.assertEqual(manifest["transcript_count"], 1)
+        self.assertEqual([source["video_id"] for source in manifest["sources"]], ["new12345678"])
+
     def test_run_agent_writes_article_and_emits_progress(self) -> None:
         events: list[dict[str, object]] = []
 
         async def fake_query(prompt: str, options: object):
             transcript_dir = Path(prompt.split("Use this exact transcript output directory:")[1].splitlines()[1])
             article_path = Path(prompt.split("Write the final Markdown article only to this exact path:")[1].splitlines()[1])
+            run_id = prompt.split("Use this exact run id:")[1].splitlines()[1]
             transcript_dir.mkdir(parents=True, exist_ok=True)
             (transcript_dir / "demo.transcript.json").write_text(
-                json.dumps({"segments": [{"text": "hello"}]}),
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "video": {
+                            "video_id": "hmtuvNfytjM",
+                            "title": "Demo",
+                            "channel": "Demo Channel",
+                            "url": "https://www.youtube.com/watch?v=hmtuvNfytjM",
+                        },
+                        "source_kind": "transcript",
+                        "coverage": {"segments_count": 1},
+                        "segments": [{"text": "hello"}],
+                    }
+                ),
                 encoding="utf-8",
             )
             article_path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,8 +330,25 @@ class PodcastArticleAgentTests(unittest.TestCase):
                         )
                     )
                     article_exists = article_path.exists()
+                    workspace_dir = article_path.parents[2]
+                    run_manifest = json.loads((workspace_dir / "run-manifest.json").read_text(encoding="utf-8"))
+                    sources_manifest = json.loads((workspace_dir / "sources-manifest.json").read_text(encoding="utf-8"))
+                    article_manifest = json.loads((article_path.parent / "article-manifest.json").read_text(encoding="utf-8"))
+                    quality_report = json.loads((workspace_dir / "quality-report.json").read_text(encoding="utf-8"))
 
         self.assertTrue(article_exists)
+        self.assertEqual(run_manifest["status"], "completed")
+        self.assertEqual(run_manifest["article_path"], str(article_path))
+        self.assertEqual(run_manifest["artifacts"]["article_manifest"], str(article_path.parent / "article-manifest.json"))
+        self.assertEqual(run_manifest["artifacts"]["quality_report"], str(workspace_dir / "quality-report.json"))
+        self.assertEqual(run_manifest["artifact_summary"]["quality_status"], "passed")
+        self.assertEqual(sources_manifest["transcript_count"], 1)
+        self.assertEqual(sources_manifest["sources"][0]["video_id"], "hmtuvNfytjM")
+        self.assertTrue(sources_manifest["sources"][0]["referenced_in_article"])
+        self.assertEqual(article_manifest["timestamp_link_count"], 1)
+        self.assertEqual(article_manifest["referenced_video_ids"], ["hmtuvNfytjM"])
+        self.assertEqual(quality_report["status"], "passed")
+        self.assertEqual(quality_report["issue_count"], 0)
         phases = [event["phase"] for event in events]
         self.assertIn("source_fetch", phases)
         self.assertIn("article_write", phases)

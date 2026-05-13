@@ -23,6 +23,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default="transcripts", help="Directory where transcript JSON should be saved.")
     parser.add_argument("--language-code", default="en", help="Preferred transcript/subtitle language code.")
     parser.add_argument("--search-limit", type=int, default=5, help="Maximum number of ranked search candidates to probe.")
+    parser.add_argument("--run-id", default=None, help="Optional agent run id to attach to generated artifacts.")
     return parser.parse_args(argv)
 
 
@@ -37,6 +38,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             output_dir=output_dir,
             language_code=args.language_code,
             search_limit=args.search_limit,
+            run_id=args.run_id,
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

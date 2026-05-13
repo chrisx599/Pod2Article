@@ -19,6 +19,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Search YouTube and save normalized candidate results.")
     parser.add_argument("query", help="YouTube search query.")
     parser.add_argument("--output-dir", default="search-results", help="Directory where search JSON should be saved.")
+    parser.add_argument("--run-id", default=None, help="Optional agent run id to attach to generated artifacts.")
     return parser.parse_args(argv)
 
 
@@ -31,6 +32,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         output_path = search_youtube_context(
             args.query,
             output_dir=output_dir,
+            run_id=args.run_id,
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
