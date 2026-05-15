@@ -30,6 +30,7 @@ from agents.podcast_article_agent import (
     write_run_manifest,
     write_sources_manifest,
 )
+from agents.log_format import sanitize_for_log
 
 
 @dataclass
@@ -233,6 +234,25 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(payload["session_id"], "session-1")
         self.assertEqual(payload["content"][0]["input"]["SERPAPI_API_KEY"], "<set>")
         self.assertNotIn("secret-value", str(payload))
+
+    def test_log_sanitizer_preserves_usage_token_counts(self) -> None:
+        payload = sanitize_for_log(
+            {
+                "ANTHROPIC_AUTH_TOKEN": "secret-token",
+                "model_usage": {
+                    "deepseek-v4-pro": {
+                        "inputTokens": 123,
+                        "outputTokens": 45,
+                        "cacheReadInputTokens": 67,
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(payload["ANTHROPIC_AUTH_TOKEN"], "<set>")
+        self.assertEqual(payload["model_usage"]["deepseek-v4-pro"]["inputTokens"], 123)
+        self.assertEqual(payload["model_usage"]["deepseek-v4-pro"]["outputTokens"], 45)
+        self.assertEqual(payload["model_usage"]["deepseek-v4-pro"]["cacheReadInputTokens"], 67)
 
     def test_find_transcript_context_returns_latest_non_empty_file(self) -> None:
         with TemporaryDirectory() as tmpdir:

@@ -8,6 +8,18 @@ import time
 
 
 SECRET_KEYS = {"ANTHROPIC_API_KEY", "SERPAPI_API_KEY", "api_key", "authorization", "Authorization"}
+USAGE_TOKEN_KEYS = {
+    "cacheCreationInputTokens",
+    "cacheReadInputTokens",
+    "inputTokens",
+    "maxOutputTokens",
+    "outputTokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "input_tokens",
+    "max_output_tokens",
+    "output_tokens",
+}
 LOG_SEPARATOR = "=" * 80
 LOG_SUB_SEPARATOR = "-" * 80
 
@@ -40,7 +52,9 @@ def sanitize_for_log(value: object) -> object:
         sanitized: dict[str, object] = {}
         for key, item in value.items():
             key_text = str(key)
-            if key_text in SECRET_KEYS or "key" in key_text.lower() or "token" in key_text.lower():
+            if key_text in USAGE_TOKEN_KEYS:
+                sanitized[key_text] = sanitize_for_log(item)
+            elif key_text in SECRET_KEYS or "key" in key_text.lower() or "token" in key_text.lower():
                 sanitized[key_text] = "<set>" if item else None
             else:
                 sanitized[key_text] = sanitize_for_log(item)
@@ -88,4 +102,3 @@ def format_log_text_block(event: str, text: str) -> str:
             _indent_text(text),
         ]
     )
-
