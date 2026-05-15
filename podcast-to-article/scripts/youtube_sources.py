@@ -5,10 +5,11 @@ import json
 import math
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 if __package__ in {None, ""}:
     CURRENT_DIR = Path(__file__).resolve().parent
@@ -28,6 +29,12 @@ CODE_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = CODE_ROOT.parent
 SEARCH_QUERY_HASH_LENGTH = 8
 SEARCH_MANIFEST_FILENAME = "search-manifest.json"
+RESEARCH_PLAN_FILENAME = "research-plan.json"
+VIDEO_ENRICHMENT_MANIFEST_FILENAME = "video-enrichment-manifest.json"
+SELECTION_MANIFEST_FILENAME = "selection-manifest.json"
+DEFAULT_DISCOVERY_QUERY_COUNT = 4
+DEFAULT_DISCOVERY_ENRICHMENT_LIMIT = 14
+DEFAULT_SELECTION_CANDIDATE_LIMIT = 18
 LATIN_STOPWORDS = {
     "a",
     "an",
@@ -183,6 +190,9 @@ class VideoCandidate:
     views: Optional[int] = None
     published_date: Optional[str] = None
     description: Optional[str] = None
+    source_bucket: str = "video_results"
+    discovery_source: Optional[str] = None
+    score_breakdown: Optional[dict[str, float]] = None
 
 
 @dataclass
@@ -270,12 +280,18 @@ def parse_metadata(metadata_payload: dict[str, Any], video_id: str) -> dict[str,
     }
 
 
+def _with_source_bucket(item: dict[str, Any], bucket: str) -> dict[str, Any]:
+    copied = dict(item)
+    copied["_source_bucket"] = bucket
+    return copied
+
+
 def _flatten_search_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     serpapi_results: list[dict[str, Any]] = []
-    for key in ("video_results", "ads_results"):
+    for key in ("video_results", "shorts_results", "short_videos", "ads_results"):
         value = payload.get(key)
         if isinstance(value, list):
-            serpapi_results.extend(item for item in value if isinstance(item, dict))
+            serpapi_results.extend(_with_source_bucket(item, key) for item in value if isinstance(item, dict))
     if serpapi_results:
         return serpapi_results
 
@@ -288,11 +304,11 @@ def _flatten_search_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
             decoded = json.loads(content)
         except (OSError, json.JSONDecodeError):
             return []
-        return [item for item in decoded if isinstance(item, dict)]
+        return [_with_source_bucket(item, "legacy_results") for item in decoded if isinstance(item, dict)]
     if isinstance(content, dict) and isinstance(content.get("results"), list):
-        return [item for item in content["results"] if isinstance(item, dict)]
+        return [_with_source_bucket(item, "legacy_results") for item in content["results"] if isinstance(item, dict)]
     if isinstance(content, list):
-        return [item for item in content if isinstance(item, dict)]
+        return [_with_source_bucket(item, "legacy_results") for item in content if isinstance(item, dict)]
     return []
 
 
@@ -431,6 +447,29 @@ def _direct_leader_source_bonus(title: str, channel: str, description: str, quer
     return bonus
 
 
+def _candidate_score_breakdown(
+    *,
+    query_terms: set[str],
+    title: str,
+    channel: str,
+    description: str,
+    duration_sec: Optional[int],
+    views: Optional[int],
+    position: Any,
+) -> dict[str, float]:
+    position_bonus = max(0.0, (10.0 - float(position)) * 0.15) if isinstance(position, (int, float)) else 0.0
+    return {
+        "position_bonus": round(position_bonus, 4),
+        "title_match": round(_term_overlap_score(query_terms, title, 2.0), 4),
+        "channel_match": round(_term_overlap_score(query_terms, channel, 2.3), 4),
+        "description_match": round(_term_overlap_score(query_terms, description, 0.55), 4),
+        "duration_bonus": round(_duration_bonus(duration_sec), 4),
+        "views_bonus": round(_views_bonus(views), 4),
+        "source_format_bonus": round(_source_format_bonus(title, description, query_terms), 4),
+        "direct_source_bonus": round(_direct_leader_source_bonus(title, channel, description, query_terms), 4),
+    }
+
+
 def _candidate_score(
     *,
     query_terms: set[str],
@@ -441,16 +480,20 @@ def _candidate_score(
     views: Optional[int],
     position: Any,
 ) -> float:
-    position_bonus = max(0.0, (10.0 - float(position)) * 0.15) if isinstance(position, (int, float)) else 0.0
-    score = position_bonus
-    score += _term_overlap_score(query_terms, title, 2.0)
-    score += _term_overlap_score(query_terms, channel, 2.3)
-    score += _term_overlap_score(query_terms, description, 0.55)
-    score += _duration_bonus(duration_sec)
-    score += _views_bonus(views)
-    score += _source_format_bonus(title, description, query_terms)
-    score += _direct_leader_source_bonus(title, channel, description, query_terms)
-    return round(score, 4)
+    return round(
+        sum(
+            _candidate_score_breakdown(
+                query_terms=query_terms,
+                title=title,
+                channel=channel,
+                description=description,
+                duration_sec=duration_sec,
+                views=views,
+                position=position,
+            ).values()
+        ),
+        4,
+    )
 
 
 def search_candidates(payload: dict[str, Any], query: str) -> list[VideoCandidate]:
@@ -479,6 +522,15 @@ def search_candidates(payload: dict[str, Any], query: str) -> list[VideoCandidat
         )
         position = item.get("position_on_page") or fallback_position
         views = _parse_views(item.get("views") or item.get("views_count") or item.get("view_count"))
+        score_breakdown = _candidate_score_breakdown(
+            query_terms=query_terms,
+            title=title,
+            channel=channel,
+            description=description,
+            duration_sec=duration_sec,
+            views=views,
+            position=position,
+        )
         candidates.append(
             VideoCandidate(
                 video_id=video_id,
@@ -486,23 +538,486 @@ def search_candidates(payload: dict[str, Any], query: str) -> list[VideoCandidat
                 channel=channel,
                 url=item.get("url") or item.get("link") or f"https://www.youtube.com/watch?v={video_id}",
                 duration_sec=duration_sec,
-                score=_candidate_score(
-                    query_terms=query_terms,
-                    title=title,
-                    channel=channel,
-                    description=description,
-                    duration_sec=duration_sec,
-                    views=views,
-                    position=position,
-                ),
+                score=round(sum(score_breakdown.values()), 4),
                 transcript_available=False,
                 subtitles_available=False,
                 views=views,
                 published_date=_text(item.get("published_date") or item.get("published_time")),
                 description=description,
+                source_bucket=str(item.get("_source_bucket") or "video_results"),
+                score_breakdown=score_breakdown,
             )
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)
+
+
+def _candidate_payload(candidate: VideoCandidate) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in candidate.__dict__.items()
+        if value is not None
+    }
+
+
+def extract_related_search_queries(payload: dict[str, Any]) -> list[str]:
+    queries: list[str] = []
+    for key in ("related_searches", "search_refinements", "refine_this_search"):
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if isinstance(item, str):
+                query = item
+            elif isinstance(item, dict):
+                query = _text(item.get("query") or item.get("title") or item.get("name"))
+            else:
+                query = ""
+            query = canonicalize_search_query(query)
+            if query and query not in queries:
+                queries.append(query)
+    return queries
+
+
+def _transcript_link(payload: dict[str, Any]) -> Optional[str]:
+    stack: list[Any] = [payload]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for key, value in item.items():
+                if isinstance(value, str) and "youtube_video_transcript" in value:
+                    return value
+                if "transcript" in key.lower() and isinstance(value, str) and value.startswith(("http://", "https://")):
+                    return value
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(item, list):
+            stack.extend(value for value in item if isinstance(value, (dict, list)))
+    return None
+
+
+def _extract_video_candidates_from_items(
+    items: Any,
+    *,
+    source_bucket: str,
+    discovery_source: str,
+    query_terms: set[str],
+) -> list[VideoCandidate]:
+    if not isinstance(items, list):
+        return []
+    candidates: list[VideoCandidate] = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        video_id = (
+            item.get("video_id")
+            or item.get("videoId")
+            or item.get("id")
+            or extract_video_id(str(item.get("link") or item.get("url") or ""))
+        )
+        if not isinstance(video_id, str) or not video_id:
+            continue
+        title = _nested_text(item.get("title")) or _text(item.get("name")) or f"Video {video_id}"
+        channel = _channel_name(item.get("channel")) or _channel_name(item.get("uploader")) or _text(item.get("author")) or "Unknown channel"
+        description = _text(item.get("description") or item.get("snippet"))
+        duration_sec = parse_duration_seconds(item.get("duration") or item.get("length") or item.get("durationSeconds"))
+        views = _parse_views(item.get("views") or item.get("views_count") or item.get("view_count"))
+        breakdown = _candidate_score_breakdown(
+            query_terms=query_terms,
+            title=title,
+            channel=channel,
+            description=description,
+            duration_sec=duration_sec,
+            views=views,
+            position=index,
+        )
+        candidates.append(
+            VideoCandidate(
+                video_id=video_id,
+                title=title,
+                channel=channel,
+                url=str(item.get("url") or item.get("link") or f"https://www.youtube.com/watch?v={video_id}"),
+                duration_sec=duration_sec,
+                score=round(sum(breakdown.values()) + 0.7, 4),
+                transcript_available=False,
+                subtitles_available=False,
+                views=views,
+                published_date=_text(item.get("published_date") or item.get("published_time")),
+                description=description,
+                source_bucket=source_bucket,
+                discovery_source=discovery_source,
+                score_breakdown={**breakdown, "related_video_bonus": 0.7},
+            )
+        )
+    return candidates
+
+
+def normalize_video_enrichment(video_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = parse_metadata(payload, video_id)
+    query_terms = _search_tokens(f"{metadata.get('title', '')} {metadata.get('channel', '')}")
+    related_candidates: list[VideoCandidate] = []
+    for key in ("related_videos", "related_video_results", "end_screen_video_results"):
+        related_candidates.extend(
+            _extract_video_candidates_from_items(
+                payload.get(key),
+                source_bucket=key,
+                discovery_source=video_id,
+                query_terms=query_terms,
+            )
+        )
+    return {
+        "video_id": video_id,
+        "title": metadata.get("title"),
+        "channel": metadata.get("channel"),
+        "duration_sec": metadata.get("duration_sec"),
+        "language": metadata.get("language"),
+        "url": metadata.get("url"),
+        "views": _parse_views(payload.get("views") or payload.get("view_count")),
+        "description": _text(payload.get("description")),
+        "chapters_count": len(metadata.get("chapters") or []),
+        "has_transcript_link": _transcript_link(payload) is not None,
+        "transcript_link": _transcript_link(payload),
+        "related_video_ids": [candidate.video_id for candidate in related_candidates],
+        "related_candidates": [_candidate_payload(candidate) for candidate in related_candidates],
+    }
+
+
+def _merge_candidates(candidates: Iterable[VideoCandidate]) -> list[VideoCandidate]:
+    merged: dict[str, VideoCandidate] = {}
+    for candidate in candidates:
+        existing = merged.get(candidate.video_id)
+        if existing is None or candidate.score > existing.score:
+            merged[candidate.video_id] = candidate
+            continue
+        if not existing.description and candidate.description:
+            existing.description = candidate.description
+    return sorted(merged.values(), key=lambda item: item.score, reverse=True)
+
+
+def _candidate_from_payload(payload: dict[str, Any]) -> Optional[VideoCandidate]:
+    video_id = payload.get("video_id")
+    if not isinstance(video_id, str) or not video_id:
+        return None
+    score = payload.get("score")
+    score_value = float(score) if isinstance(score, (int, float)) else 0.0
+    score_breakdown = payload.get("score_breakdown")
+    return VideoCandidate(
+        video_id=video_id,
+        title=str(payload.get("title") or f"Video {video_id}"),
+        channel=str(payload.get("channel") or "Unknown channel"),
+        url=str(payload.get("url") or f"https://www.youtube.com/watch?v={video_id}"),
+        duration_sec=parse_duration_seconds(payload.get("duration_sec")),
+        score=score_value,
+        transcript_available=bool(payload.get("transcript_available")),
+        subtitles_available=bool(payload.get("subtitles_available")),
+        views=_parse_views(payload.get("views")),
+        published_date=str(payload["published_date"]) if payload.get("published_date") else None,
+        description=str(payload["description"]) if payload.get("description") else None,
+        source_bucket=str(payload.get("source_bucket") or "video_results"),
+        discovery_source=str(payload["discovery_source"]) if payload.get("discovery_source") else None,
+        score_breakdown=score_breakdown if isinstance(score_breakdown, dict) else None,
+    )
+
+
+def build_research_queries(input_value: str, question: str, *, research_mode: str = "wide") -> list[dict[str, Any]]:
+    topic = re.sub(r"\s+", " ", (question or input_value).strip())
+    compact = re.sub(
+        r"(请|帮我|调研|研究|写一篇|文章|深度|总结|关于|please|write|research|article|summarize)",
+        " ",
+        topic,
+        flags=re.IGNORECASE,
+    )
+    compact = re.sub(r"\s+", " ", compact).strip() or topic
+    base_terms = [compact]
+    if input_value.strip() and input_value.strip() != question.strip() and detect_input_type(input_value) == "search_query":
+        base_terms.insert(0, input_value.strip())
+
+    suffixes = ["访谈 podcast", "interview talk", "panel keynote"]
+    if re.search(r"[\u3400-\u9fff]", topic):
+        suffixes.insert(0, "对谈 访谈 演讲")
+    queries: list[dict[str, Any]] = []
+    for base in base_terms:
+        for suffix in suffixes:
+            query = canonicalize_search_query(f"{base} {suffix}")
+            if not query or any(item["query"] == query for item in queries):
+                continue
+            queries.append(
+                {
+                    "round": 1,
+                    "query": query,
+                    "intent": "discover direct long-form YouTube sources",
+                    "expected_source_type": "interview/podcast/talk/panel/keynote",
+                    "language": "mixed",
+                }
+            )
+            if len(queries) >= DEFAULT_DISCOVERY_QUERY_COUNT:
+                return queries
+    return queries
+
+
+def _run_parallel_searches(client: Any, queries: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any] | None, str | None]]:
+    results: list[tuple[dict[str, Any], dict[str, Any] | None, str | None]] = []
+    with ThreadPoolExecutor(max_workers=min(4, max(len(queries), 1))) as executor:
+        future_map = {executor.submit(client.search, str(item["query"])): item for item in queries}
+        for future in as_completed(future_map):
+            item = future_map[future]
+            try:
+                results.append((item, future.result(), None))
+            except Exception as exc:
+                results.append((item, None, str(exc)))
+    return results
+
+
+def _run_parallel_enrichment(client: Any, candidates: list[VideoCandidate]) -> list[dict[str, Any]]:
+    enrichments: list[dict[str, Any]] = []
+    if not candidates or not hasattr(client, "metadata"):
+        return enrichments
+    with ThreadPoolExecutor(max_workers=min(6, len(candidates))) as executor:
+        future_map = {executor.submit(client.metadata, candidate.video_id): candidate for candidate in candidates}
+        for future in as_completed(future_map):
+            candidate = future_map[future]
+            try:
+                payload = future.result()
+                enrichment = normalize_video_enrichment(candidate.video_id, payload)
+                enrichment["source_candidate"] = _candidate_payload(candidate)
+                enrichments.append(enrichment)
+            except Exception as exc:
+                enrichments.append(
+                    {
+                        "video_id": candidate.video_id,
+                        "title": candidate.title,
+                        "channel": candidate.channel,
+                        "error": str(exc),
+                        "source_candidate": _candidate_payload(candidate),
+                    }
+                )
+    return sorted(enrichments, key=lambda item: str(item.get("video_id")))
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def write_search_artifacts(
+    *,
+    query: str,
+    payload: dict[str, Any],
+    output_dir: Path,
+    run_id: str | None = None,
+    round_number: int | None = None,
+) -> Path:
+    candidates = search_candidates(payload, query)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    canonical_query = canonicalize_search_query(query)
+    query_hash = hashlib.sha256(canonical_query.encode("utf-8")).hexdigest()[:SEARCH_QUERY_HASH_LENGTH]
+    destination = unique_search_output_path(canonical_query, output_dir=output_dir, query_hash=query_hash)
+    raw_destination = raw_search_output_path(destination)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    _write_json(
+        raw_destination,
+        {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "run_id": run_id,
+            "query": query,
+            "canonical_query": canonical_query,
+            "query_hash": query_hash,
+            "provider": "serpapi",
+            "payload": payload,
+        },
+    )
+    _write_json(
+        destination,
+        {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "run_id": run_id,
+            "query": query,
+            "canonical_query": canonical_query,
+            "query_hash": query_hash,
+            "provider": "serpapi",
+            "raw_output_path": str(raw_destination),
+            "candidate_buckets": {
+                key: len(value) for key, value in payload.items() if isinstance(value, list) and key.endswith("_results")
+            },
+            "related_search_queries": extract_related_search_queries(payload),
+            "candidates": [_candidate_payload(candidate) for candidate in candidates],
+        },
+    )
+    entry = {
+        "created_at": generated_at,
+        "run_id": run_id,
+        "query": query,
+        "canonical_query": canonical_query,
+        "query_hash": query_hash,
+        "provider": "serpapi",
+        "output_path": str(destination),
+        "raw_output_path": str(raw_destination),
+        "candidate_count": len(candidates),
+        "top_video_ids": [candidate.video_id for candidate in candidates[:5]],
+    }
+    if round_number is not None:
+        entry["search_round"] = round_number
+    append_search_manifest(output_dir, entry)
+    return destination
+
+
+def prepare_research_discovery(
+    *,
+    input_value: str,
+    question: str,
+    research_mode: str,
+    workspace_dir: Path,
+    search_dir: Path,
+    run_id: str,
+    max_search_rounds: int = 2,
+    enrichment_limit: int = DEFAULT_DISCOVERY_ENRICHMENT_LIMIT,
+    selection_candidate_limit: int = DEFAULT_SELECTION_CANDIDATE_LIMIT,
+    client: Optional[Any] = None,
+) -> dict[str, Path]:
+    runtime_client = build_runtime_client(client, Path.cwd())
+    generated_at = datetime.now(timezone.utc).isoformat()
+    search_dir.mkdir(parents=True, exist_ok=True)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    planned_queries = build_research_queries(input_value, question, research_mode=research_mode)
+    plan_path = workspace_dir / RESEARCH_PLAN_FILENAME
+    _write_json(
+        plan_path,
+        {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "run_id": run_id,
+            "input": input_value,
+            "question": question,
+            "research_mode": research_mode,
+            "strategy": "adaptive_transcript_acquisition",
+            "transcript_policy": {
+                "mode": "model_decides",
+                "quality_rule": "No fixed transcript count; read every transcript needed to answer the question comprehensively.",
+            },
+            "queries": planned_queries,
+        },
+    )
+
+    search_payloads: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    search_paths: list[str] = []
+    errors: list[dict[str, Any]] = []
+    for query_info, payload, error in _run_parallel_searches(runtime_client, planned_queries):
+        if error or payload is None:
+            errors.append({"query": query_info.get("query"), "round": query_info.get("round"), "error": error})
+            continue
+        search_payloads.append((query_info, payload))
+        search_paths.append(
+            str(
+                write_search_artifacts(
+                    query=str(query_info["query"]),
+                    payload=payload,
+                    output_dir=search_dir,
+                    run_id=run_id,
+                    round_number=int(query_info.get("round") or 1),
+                )
+            )
+        )
+
+    if max_search_rounds > 1:
+        existing_queries = {str(item["query"]) for item in planned_queries}
+        related_queries: list[dict[str, Any]] = []
+        for _, payload in search_payloads:
+            for related_query in extract_related_search_queries(payload):
+                if related_query in existing_queries:
+                    continue
+                related_queries.append(
+                    {
+                        "round": 2,
+                        "query": related_query,
+                        "intent": "follow SerpApi related search expansion",
+                        "expected_source_type": "related YouTube results",
+                        "language": "mixed",
+                    }
+                )
+                existing_queries.add(related_query)
+                if len(related_queries) >= 2:
+                    break
+            if len(related_queries) >= 2:
+                break
+        if related_queries:
+            planned_queries.extend(related_queries)
+            plan_payload = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan_payload["queries"] = planned_queries
+            plan_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _write_json(plan_path, plan_payload)
+            for query_info, payload, error in _run_parallel_searches(runtime_client, related_queries):
+                if error or payload is None:
+                    errors.append({"query": query_info.get("query"), "round": query_info.get("round"), "error": error})
+                    continue
+                search_payloads.append((query_info, payload))
+                search_paths.append(
+                    str(
+                        write_search_artifacts(
+                            query=str(query_info["query"]),
+                            payload=payload,
+                            output_dir=search_dir,
+                            run_id=run_id,
+                            round_number=2,
+                        )
+                    )
+                )
+
+    all_candidates = _merge_candidates(
+        candidate
+        for query_info, payload in search_payloads
+        for candidate in search_candidates(payload, str(query_info["query"]))
+    )
+    enrichments = _run_parallel_enrichment(runtime_client, all_candidates[:enrichment_limit])
+    related_candidates = _merge_candidates(
+        hydrated
+        for enrichment in enrichments
+        for candidate in enrichment.get("related_candidates", [])
+        if isinstance(candidate, dict)
+        for hydrated in [_candidate_from_payload(candidate)]
+        if hydrated is not None
+    )
+    candidate_pool = _merge_candidates([*all_candidates, *related_candidates])
+    selection_candidates = candidate_pool[:selection_candidate_limit]
+    enrichment_path = workspace_dir / VIDEO_ENRICHMENT_MANIFEST_FILENAME
+    _write_json(
+        enrichment_path,
+        {
+            "schema_version": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "run_id": run_id,
+            "provider": "serpapi",
+            "search_paths": search_paths,
+            "enrichment_count": len(enrichments),
+            "enrichments": enrichments,
+        },
+    )
+    selection_path = workspace_dir / SELECTION_MANIFEST_FILENAME
+    _write_json(
+        selection_path,
+        {
+            "schema_version": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "run_id": run_id,
+            "strategy": "model_selects_transcripts_from_ranked_candidates",
+            "transcript_policy": {
+                "mode": "adaptive",
+                "instruction": "The writing agent should fetch and read as many transcript files as needed; there is no fixed target count.",
+            },
+            "search_round_count": max((int(item.get("round") or 1) for item in planned_queries), default=0),
+            "candidate_count": len(candidate_pool),
+            "selected_candidates": [_candidate_payload(candidate) for candidate in selection_candidates],
+            "skipped_sources": [],
+            "errors": errors,
+        },
+    )
+    return {
+        "research_plan": plan_path,
+        "video_enrichment_manifest": enrichment_path,
+        "selection_manifest": selection_path,
+    }
 
 
 def resolve_single_video(
@@ -560,64 +1075,7 @@ def search_youtube_context(
 ) -> Path:
     runtime_client = build_runtime_client(client, Path.cwd())
     payload = runtime_client.search(query)
-    candidates = search_candidates(payload, query)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    canonical_query = canonicalize_search_query(query)
-    query_hash = hashlib.sha256(canonical_query.encode("utf-8")).hexdigest()[:SEARCH_QUERY_HASH_LENGTH]
-    destination = unique_search_output_path(canonical_query, output_dir=output_dir, query_hash=query_hash)
-    raw_destination = raw_search_output_path(destination)
-    generated_at = datetime.now(timezone.utc).isoformat()
-    raw_destination.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "generated_at": generated_at,
-                "run_id": run_id,
-                "query": query,
-                "canonical_query": canonical_query,
-                "query_hash": query_hash,
-                "provider": "serpapi",
-                "payload": payload,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    destination.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "generated_at": generated_at,
-                "run_id": run_id,
-                "query": query,
-                "canonical_query": canonical_query,
-                "query_hash": query_hash,
-                "provider": "serpapi",
-                "raw_output_path": str(raw_destination),
-                "candidates": [candidate.__dict__ for candidate in candidates],
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    append_search_manifest(
-        output_dir,
-        {
-            "created_at": generated_at,
-            "run_id": run_id,
-            "query": query,
-            "canonical_query": canonical_query,
-            "query_hash": query_hash,
-            "provider": "serpapi",
-            "output_path": str(destination),
-            "raw_output_path": str(raw_destination),
-            "candidate_count": len(candidates),
-            "top_video_ids": [candidate.video_id for candidate in candidates[:5]],
-        },
-    )
-    return destination
+    return write_search_artifacts(query=query, payload=payload, output_dir=output_dir, run_id=run_id)
 
 
 def canonicalize_search_query(query: str) -> str:

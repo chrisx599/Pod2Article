@@ -26,6 +26,7 @@ from agents.podcast_article_agent import (
     resolve_model,
     run_agent,
     serialize_message,
+    should_prepare_discovery,
     write_run_manifest,
     write_sources_manifest,
 )
@@ -82,16 +83,21 @@ class PodcastArticleAgentTests(unittest.TestCase):
             research_mode="wide",
         )
 
-        self.assertIn("Derive 2-3 concise, complementary YouTube search queries", prompt)
-        self.assertIn('search_youtube.py "<derived-search-query>"', prompt)
+        self.assertIn("Required adaptive wide-search workflow", prompt)
+        self.assertIn("There is no fixed transcript count target", prompt)
+        self.assertIn('fetch_transcript.py "<selected-video-url>"', prompt)
         self.assertIn("--run-id article-20260510T123000Z-abcdef12", prompt)
         self.assertIn("Enforce source diversity", prompt)
-        self.assertIn("Do not count third-party media analysis", prompt)
-        self.assertIn("Avoid broad English queries", prompt)
+        self.assertIn("Use third-party analysis only as background context", prompt)
         self.assertIn("Do not let one long transcript dominate", prompt)
-        self.assertIn("Open `search-manifest.json`", prompt)
-        self.assertIn("search_queries: <derived search queries>", prompt)
+        self.assertIn("Open the prebuilt discovery artifacts", prompt)
+        self.assertIn("search_queries: <prebuilt and supplemental search queries used>", prompt)
         self.assertNotIn(f"search_youtube.py {shlex.quote(question)}", prompt)
+
+    def test_should_prepare_discovery_for_wide_or_search_query_deep(self) -> None:
+        self.assertTrue(should_prepare_discovery("ai founder interviews", "deep"))
+        self.assertTrue(should_prepare_discovery("ai founder interviews", "wide"))
+        self.assertFalse(should_prepare_discovery("https://www.youtube.com/watch?v=hmtuvNfytjM", "deep"))
 
     def test_build_article_dir_adds_uuid_suffix(self) -> None:
         fixed_now = datetime(2026, 5, 10, 12, 30, tzinfo=timezone.utc)

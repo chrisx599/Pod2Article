@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sys
 from typing import Callable, Iterable
 from urllib.parse import parse_qs, urlparse
 import uuid
@@ -52,6 +53,13 @@ RUN_MANIFEST_FILENAME = "run-manifest.json"
 SOURCES_MANIFEST_FILENAME = "sources-manifest.json"
 ARTICLE_MANIFEST_FILENAME = "article-manifest.json"
 QUALITY_REPORT_FILENAME = "quality-report.json"
+RESEARCH_PLAN_FILENAME = "research-plan.json"
+VIDEO_ENRICHMENT_MANIFEST_FILENAME = "video-enrichment-manifest.json"
+SELECTION_MANIFEST_FILENAME = "selection-manifest.json"
+PODCAST_SCRIPTS_DIR = PROJECT_ROOT / "podcast-to-article" / "scripts"
+if str(PODCAST_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(PODCAST_SCRIPTS_DIR))
+from youtube_sources import prepare_research_discovery  # noqa: E402
 
 
 def default_log_path() -> Path:
@@ -122,6 +130,9 @@ def build_prompt(
     article_path: str,
     run_id: str | None = None,
     research_mode: str = "deep",
+    research_plan_path: str | None = None,
+    video_enrichment_manifest_path: str | None = None,
+    selection_manifest_path: str | None = None,
 ) -> str:
     run_id_arg = f" --run-id {shlex.quote(run_id)}" if run_id else ""
     fetch_command = (
@@ -129,7 +140,15 @@ def build_prompt(
         f"{shlex.quote(input_value)} --output-dir {shlex.quote(transcript_dir)}{run_id_arg}"
     )
     run_id_block = f"\nUse this exact run id:\n{run_id}\n" if run_id else ""
-    if research_mode == "wide":
+    if research_mode == "wide" or selection_manifest_path:
+        discovery_block = ""
+        if research_plan_path and video_enrichment_manifest_path and selection_manifest_path:
+            discovery_block = f"""
+Prebuilt SerpApi discovery artifacts:
+- research plan: {research_plan_path}
+- video enrichment manifest: {video_enrichment_manifest_path}
+- selection manifest: {selection_manifest_path}
+"""
         return f"""Use the {SKILL_NAME} skill to produce a grounded wide video deep research article.
 
 Research topic:
@@ -147,28 +166,22 @@ Use this exact search output directory:
 Use this exact transcript output directory:
 {transcript_dir}
 {run_id_block}
+{discovery_block}
 
 Write the final Markdown article only to this exact path:
 {article_path}
 
-Required wide-search workflow:
-1. Derive 2-3 concise, complementary YouTube search queries from the research topic before running any search tool. Do not use the full user request verbatim unless it is already a compact search phrase.
-   - Prefer concrete entities, domain terms, and source formats such as interview, podcast, talk, panel, or keynote.
-   - Remove task wording such as "please research", "write an article", "summarize", or "help me".
-   - Add a year, region, person, company, or product name only when the research topic supports it.
-   - For Chinese topics, use the most likely YouTube-discoverable query. Include English terms such as AI, AGI, LLM, agent, interview, or podcast when they materially improve recall.
-   - Use one primary precise query and one broader/source-format query. Add a bilingual or English query only when it is likely to improve YouTube recall.
-   - If the topic asks about a broad group such as industry leaders, founders, investors, researchers, or companies, do not anchor all queries on one prominent person. Spread queries across roles, organizations, and viewpoints unless the user named a specific person.
-   - If the user asks for Chinese industry leaders or Chinese companies, the main queries must target direct Chinese sources: Chinese-language interviews, talks, panels, keynotes, and founder/executive names or company names. Avoid broad English queries such as "China AI race", "China AI founder podcast", or "China AI analysis" unless they include a specific Chinese speaker or company.
-2. Run the bundled YouTube search tool from the repository root for each derived query:
-   python3 podcast-to-article/scripts/search_youtube.py "<derived-search-query>" --output-dir {shlex.quote(search_dir)}{run_id_arg}
-3. Open `search-manifest.json` in the search output directory, then open every generated `.search.json` entry for this run id. Merge candidates by video_id, inspect the ranked candidates, and choose 3-5 relevant videos when available. Prefer substantive interviews, talks, panels, keynotes, or podcast episodes over short clips, reactions, trailers, and news snippets.
+Required adaptive wide-search workflow:
+1. Open the prebuilt discovery artifacts listed above when present. Also open `search-manifest.json` in the search output directory and the generated `.search.json` files for this run id.
+2. Use the ranked candidates and SerpApi YouTube Video API enrichment data to decide which videos need transcript review. There is no fixed transcript count target. Fetch and read as many transcript files as needed to answer the research topic comprehensively, then stop when additional transcripts would be redundant.
+   - Prefer substantive interviews, talks, panels, keynotes, or podcast episodes over short clips, reactions, trailers, and news snippets.
    - Enforce source diversity when the topic is broad: prefer different speakers, channels, organizations, roles, and perspectives over multiple videos centered on the same person or event.
-   - If the best usable candidates are skewed toward one person, run one additional broader query before drafting to fill the missing coverage.
-   - For a question about what a group of people thinks, selected main sources must be first-person or event sources from that group: the leader speaking, being interviewed, joining a panel, or giving a talk. Do not count third-party media analysis, news explainers, or foreign podcasts discussing China as "industry leader" coverage.
-   - Use third-party analysis only as background context and at most one supporting source. If fewer than two direct in-scope transcripts are available, continue searching with named Chinese speakers/companies before drafting.
-4. For each selected video, run the bundled transcript fetcher with the video URL. If a selected candidate has no transcript/subtitles, skip it and continue down the ranked list until you have up to 3-5 usable transcript files or all relevant candidates are exhausted:
+   - For a question about what a group of people thinks, main sources should be first-person or event sources from that group: the leader speaking, being interviewed, joining a panel, or giving a talk.
+   - Use third-party analysis only as background context and avoid letting it replace direct in-scope sources.
+3. For every video you decide is needed, run the bundled transcript fetcher with the video URL. If a selected candidate has no transcript/subtitles, skip it and continue down the ranked candidates or run an additional targeted search if coverage is still weak:
    python3 podcast-to-article/scripts/fetch_transcript.py "<selected-video-url>" --output-dir {shlex.quote(transcript_dir)}{run_id_arg}
+4. If the prebuilt candidate pool is insufficient, run the bundled YouTube search tool with a targeted supplemental query and then fetch any transcript you need:
+   python3 podcast-to-article/scripts/search_youtube.py "<supplemental-search-query>" --output-dir {shlex.quote(search_dir)}{run_id_arg}
 5. Open and read every generated `.transcript.json` file before drafting.
 6. Create source coverage notes before drafting: for each transcript, identify the speaker/channel, role, whether it is direct first-person evidence or third-party analysis, main claims, and where it adds a distinct perspective. Use every usable in-scope direct transcript in the synthesis unless it is clearly off-topic; if a transcript is excluded, state the exclusion reason in the article.
 7. Synthesize across the gathered transcripts. Compare recurring claims, changes over time, disagreements, and caveats when the source material supports them. Do not let one long transcript dominate a broad-topic article when other usable transcripts are available.
@@ -184,7 +197,7 @@ Required outputs:
 If only one relevant transcript can be acquired, write the article from that transcript and state the coverage limitation in the article.
 
 At the end, print:
-search_queries: <derived search queries>
+search_queries: <prebuilt and supplemental search queries used>
 search: <paths to generated search json files>
 transcripts: <paths to generated transcript json files>
 article: {article_path}
@@ -275,6 +288,9 @@ def write_run_manifest(
     sources_manifest_path: Path | None = None,
     article_manifest_path: Path | None = None,
     quality_report_path: Path | None = None,
+    research_plan_path: Path | None = None,
+    video_enrichment_manifest_path: Path | None = None,
+    selection_manifest_path: Path | None = None,
 ) -> None:
     existing = _read_json_object(path) or {}
     created_at = (
@@ -311,6 +327,11 @@ def write_run_manifest(
     resolved_sources_manifest_path = sources_manifest_path or paths["workspace_dir"] / SOURCES_MANIFEST_FILENAME
     resolved_article_manifest_path = article_manifest_path or article_path.parent / ARTICLE_MANIFEST_FILENAME
     resolved_quality_report_path = quality_report_path or paths["workspace_dir"] / QUALITY_REPORT_FILENAME
+    resolved_research_plan_path = research_plan_path or paths["workspace_dir"] / RESEARCH_PLAN_FILENAME
+    resolved_video_enrichment_manifest_path = (
+        video_enrichment_manifest_path or paths["workspace_dir"] / VIDEO_ENRICHMENT_MANIFEST_FILENAME
+    )
+    resolved_selection_manifest_path = selection_manifest_path or paths["workspace_dir"] / SELECTION_MANIFEST_FILENAME
     artifacts = payload["artifacts"]
     if not isinstance(artifacts, dict):
         artifacts = {}
@@ -318,6 +339,9 @@ def write_run_manifest(
         **artifacts,
         "article_manifest": str(resolved_article_manifest_path),
         "quality_report": str(resolved_quality_report_path),
+        "research_plan": str(resolved_research_plan_path),
+        "video_enrichment_manifest": str(resolved_video_enrichment_manifest_path),
+        "selection_manifest": str(resolved_selection_manifest_path),
     }
     sources_manifest = _read_json_object(resolved_sources_manifest_path)
     if sources_manifest is not None:
@@ -551,6 +575,9 @@ def write_quality_report(
     article_path: Path,
     sources_manifest: dict[str, object],
     article_manifest: dict[str, object] | None = None,
+    research_plan_path: Path | None = None,
+    video_enrichment_manifest_path: Path | None = None,
+    selection_manifest_path: Path | None = None,
 ) -> dict[str, object]:
     issues: list[dict[str, object]] = []
 
@@ -572,8 +599,12 @@ def write_quality_report(
     if research_mode == "wide":
         if search_count < 2:
             add_issue("warning", "wide_search_count_low", "Wide mode produced fewer than two search artifacts.")
-        if transcript_count < 2:
-            add_issue("warning", "wide_transcript_count_low", "Wide mode produced fewer than two transcript artifacts.")
+        if research_plan_path is not None and not research_plan_path.exists():
+            add_issue("warning", "research_plan_missing", "Research discovery plan artifact is missing.")
+        if video_enrichment_manifest_path is not None and not video_enrichment_manifest_path.exists():
+            add_issue("warning", "video_enrichment_missing", "SerpApi video enrichment artifact is missing.")
+        if selection_manifest_path is not None and not selection_manifest_path.exists():
+            add_issue("warning", "selection_manifest_missing", "Selection candidate artifact is missing.")
 
     missing_transcripts = sorted(referenced_ids - transcript_ids)
     if missing_transcripts:
@@ -604,6 +635,11 @@ def write_quality_report(
         "referenced_without_transcript": missing_transcripts,
         "issues": issues,
     }
+    if selection_manifest_path is not None and selection_manifest_path.exists():
+        selection_manifest = _read_json_object(selection_manifest_path)
+        if selection_manifest is not None:
+            report["selection_candidate_count"] = selection_manifest.get("candidate_count")
+            report["search_round_count"] = selection_manifest.get("search_round_count")
     _write_json(path, report)
     return report
 
@@ -618,6 +654,9 @@ def write_artifact_reports(
     article_path: Path,
     run_id: str,
     research_mode: str,
+    research_plan_path: Path | None = None,
+    video_enrichment_manifest_path: Path | None = None,
+    selection_manifest_path: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
     sources_manifest = write_sources_manifest(
         sources_manifest_path,
@@ -639,6 +678,9 @@ def write_artifact_reports(
         article_path=article_path,
         sources_manifest=sources_manifest,
         article_manifest=article_manifest,
+        research_plan_path=research_plan_path,
+        video_enrichment_manifest_path=video_enrichment_manifest_path,
+        selection_manifest_path=selection_manifest_path,
     )
     return sources_manifest, article_manifest, quality_report
 
@@ -775,6 +817,12 @@ def find_transcript_context(transcript_dir: Path) -> Path | None:
     return transcripts[0] if transcripts else None
 
 
+def should_prepare_discovery(input_value: str, research_mode: str) -> bool:
+    if research_mode == "wide":
+        return True
+    return extract_youtube_video_id(input_value) is None and not input_value.strip().startswith(("http://", "https://"))
+
+
 async def _watch_artifact_progress(
     *,
     transcript_dir: Path,
@@ -863,6 +911,9 @@ async def run_agent(
     sources_manifest_path = paths["workspace_dir"] / SOURCES_MANIFEST_FILENAME
     article_manifest_path = article_dir / ARTICLE_MANIFEST_FILENAME
     quality_report_path = paths["workspace_dir"] / QUALITY_REPORT_FILENAME
+    research_plan_path = paths["workspace_dir"] / RESEARCH_PLAN_FILENAME
+    video_enrichment_manifest_path = paths["workspace_dir"] / VIDEO_ENRICHMENT_MANIFEST_FILENAME
+    selection_manifest_path = paths["workspace_dir"] / SELECTION_MANIFEST_FILENAME
     write_run_manifest(
         run_manifest_path,
         status="running",
@@ -877,15 +928,71 @@ async def run_agent(
         sources_manifest_path=sources_manifest_path,
         article_manifest_path=article_manifest_path,
         quality_report_path=quality_report_path,
+        research_plan_path=research_plan_path,
+        video_enrichment_manifest_path=video_enrichment_manifest_path,
+        selection_manifest_path=selection_manifest_path,
     )
 
     _emit_progress(
         progress_sink,
         "phase_started",
         "source_fetch",
-        "正在获取视频转录上下文",
+        "正在准备视频研究上下文",
         data={"source_id": source_id, "research_mode": resolved_mode},
     )
+
+    discovery_artifacts: dict[str, Path] = {}
+    if should_prepare_discovery(input_value, resolved_mode):
+        _emit_progress(
+            progress_sink,
+            "phase_progress",
+            "source_fetch",
+            "正在并行搜索并富化 YouTube 候选源",
+            data={"search_dir": str(paths["search_dir"])},
+        )
+        try:
+            discovery_artifacts = prepare_research_discovery(
+                input_value=input_value,
+                question=question,
+                research_mode=resolved_mode,
+                workspace_dir=paths["workspace_dir"],
+                search_dir=paths["search_dir"],
+                run_id=run_id,
+            )
+        except Exception as exc:
+            write_artifact_reports(
+                sources_manifest_path=sources_manifest_path,
+                article_manifest_path=article_manifest_path,
+                quality_report_path=quality_report_path,
+                search_dir=paths["search_dir"],
+                transcript_dir=paths["transcript_dir"],
+                article_path=article_path,
+                run_id=run_id,
+                research_mode=resolved_mode,
+                research_plan_path=research_plan_path,
+                video_enrichment_manifest_path=video_enrichment_manifest_path,
+                selection_manifest_path=selection_manifest_path,
+            )
+            write_run_manifest(
+                run_manifest_path,
+                status="failed",
+                input_value=input_value,
+                question=question,
+                source_id=source_id,
+                research_mode=resolved_mode,
+                model=model,
+                paths=paths,
+                article_path=article_path,
+                run_id=run_id,
+                error_message=str(exc),
+                sources_manifest_path=sources_manifest_path,
+                article_manifest_path=article_manifest_path,
+                quality_report_path=quality_report_path,
+                research_plan_path=research_plan_path,
+                video_enrichment_manifest_path=video_enrichment_manifest_path,
+                selection_manifest_path=selection_manifest_path,
+            )
+            raise
 
     prompt = build_prompt(
         input_value=input_value,
@@ -896,6 +1003,17 @@ async def run_agent(
         article_path=str(article_path),
         run_id=run_id,
         research_mode=resolved_mode,
+        research_plan_path=str(discovery_artifacts.get("research_plan", research_plan_path))
+        if discovery_artifacts or resolved_mode == "wide"
+        else None,
+        video_enrichment_manifest_path=str(
+            discovery_artifacts.get("video_enrichment_manifest", video_enrichment_manifest_path)
+        )
+        if discovery_artifacts or resolved_mode == "wide"
+        else None,
+        selection_manifest_path=str(discovery_artifacts.get("selection_manifest", selection_manifest_path))
+        if discovery_artifacts or resolved_mode == "wide"
+        else None,
     )
     options = build_agent_options(project_root, model=model)
 
@@ -920,6 +1038,11 @@ async def run_agent(
         )
     )
     logger.info(format_log_event("prompt_ready", {"prompt_chars": len(prompt), "project_root": str(project_root)}))
+    discovery_report_paths = {
+        "research_plan_path": research_plan_path,
+        "video_enrichment_manifest_path": video_enrichment_manifest_path,
+        "selection_manifest_path": selection_manifest_path,
+    }
 
     stop_event = asyncio.Event()
     artifact_watcher = asyncio.create_task(
@@ -947,6 +1070,7 @@ async def run_agent(
             article_path=article_path,
             run_id=run_id,
             research_mode=resolved_mode,
+            **discovery_report_paths,
         )
         write_run_manifest(
             run_manifest_path,
@@ -963,6 +1087,7 @@ async def run_agent(
             sources_manifest_path=sources_manifest_path,
             article_manifest_path=article_manifest_path,
             quality_report_path=quality_report_path,
+            **discovery_report_paths,
         )
         _emit_progress(progress_sink, "task_failed", "failed", "任务失败")
         raise
@@ -1000,6 +1125,7 @@ async def run_agent(
                 article_path=article_path,
                 run_id=run_id,
                 research_mode=resolved_mode,
+                **discovery_report_paths,
             )
             write_run_manifest(
                 run_manifest_path,
@@ -1016,6 +1142,7 @@ async def run_agent(
                 sources_manifest_path=sources_manifest_path,
                 article_manifest_path=article_manifest_path,
                 quality_report_path=quality_report_path,
+                **discovery_report_paths,
             )
             raise
 
@@ -1029,6 +1156,7 @@ async def run_agent(
             article_path=article_path,
             run_id=run_id,
             research_mode=resolved_mode,
+            **discovery_report_paths,
         )
         write_run_manifest(
             run_manifest_path,
@@ -1045,6 +1173,7 @@ async def run_agent(
             sources_manifest_path=sources_manifest_path,
             article_manifest_path=article_manifest_path,
             quality_report_path=quality_report_path,
+            **discovery_report_paths,
         )
         raise RuntimeError("agent stopped before writing article.md")
 
@@ -1057,6 +1186,7 @@ async def run_agent(
         article_path=article_path,
         run_id=run_id,
         research_mode=resolved_mode,
+        **discovery_report_paths,
     )
     write_run_manifest(
         run_manifest_path,
@@ -1072,6 +1202,7 @@ async def run_agent(
         sources_manifest_path=sources_manifest_path,
         article_manifest_path=article_manifest_path,
         quality_report_path=quality_report_path,
+        **discovery_report_paths,
     )
 
     _emit_progress(

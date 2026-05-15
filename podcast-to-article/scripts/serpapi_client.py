@@ -49,8 +49,10 @@ class SerpApiClient:
             raise SerpApiError(f"SerpApi error: {payload['error']}")
         return payload
 
-    def search(self, query: str) -> dict[str, Any]:
-        return self._request({"engine": "youtube", "search_query": query})
+    def search(self, query: str, **params: Any) -> dict[str, Any]:
+        request_params = {"engine": "youtube", "search_query": query}
+        request_params.update(params)
+        return self._request(request_params)
 
     def metadata(self, video_id: str) -> dict[str, Any]:
         return self._request({"engine": "youtube_video", "v": video_id})
