@@ -64,6 +64,36 @@ class FailingClient(FakeClient):
         raise SerpApiError("No transcript or subtitles available.")
 
 
+class FakeAliyunAsrClient:
+    def transcribe_youtube_video(self, video_id: str) -> dict:
+        return {
+            "provider": "aliyun_asr",
+            "engine": "dashscope_asr",
+            "transcript": [
+                {
+                    "snippet": "阿里云转写提供了第一段时间戳文本。",
+                    "start_ms": 0,
+                    "end_ms": 3500,
+                },
+                {
+                    "snippet": "当 SerpApi 没有字幕时，仍然可以生成上下文。",
+                    "start_ms": 3500,
+                    "end_ms": 9000,
+                },
+            ],
+            "raw_result": {
+                "transcripts": [
+                    {
+                        "sentences": [
+                            {"begin_time": 0, "end_time": 3500, "text": "阿里云转写提供了第一段时间戳文本。"},
+                            {"begin_time": 3500, "end_time": 9000, "text": "当 SerpApi 没有字幕时，仍然可以生成上下文。"},
+                        ]
+                    }
+                ]
+            },
+        }
+
+
 class YouTubeSourcesTestCase(unittest.TestCase):
     def _fixture(self, name: str) -> dict:
         path = Path(__file__).resolve().parent / "fixtures" / name
@@ -336,6 +366,23 @@ class YouTubeSourcesTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.assertRaises(SerpApiError):
                 fetch_transcript_context("abc123def45", output_dir=Path(tmpdir), client=FailingClient(self._fixtures()))
+
+    def test_fetch_transcript_context_falls_back_to_aliyun_asr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            destination = fetch_transcript_context(
+                "https://www.youtube.com/watch?v=abc123def45",
+                output_dir=Path(tmpdir),
+                run_id="article-aliyun",
+                client=FailingClient(self._fixtures()),
+                asr_client=FakeAliyunAsrClient(),
+            )
+            payload = json.loads(destination.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["provider"], "aliyun_asr")
+        self.assertEqual(payload["source_kind"], "asr")
+        self.assertEqual(payload["origin"], "aliyun_asr")
+        self.assertGreaterEqual(payload["coverage"]["segments_count"], 1)
+        self.assertIn("阿里云转写", payload["segments"][0]["text"])
 
 
 if __name__ == "__main__":

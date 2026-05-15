@@ -15,10 +15,12 @@ if __package__ in {None, ""}:
     CURRENT_DIR = Path(__file__).resolve().parent
     if str(CURRENT_DIR) not in sys.path:
         sys.path.insert(0, str(CURRENT_DIR))
+    from aliyun_asr_client import AliyunAsrClient, aliyun_asr_is_enabled, aliyun_asr_is_preferred
     from normalize import Segment, merge_timed_segments, normalize_timed_content
     from serpapi_client import SerpApiClient, SerpApiError
     from utils import detect_input_type, extract_video_id, format_timestamp, load_local_env, parse_serpapi_key, slugify
 else:
+    from .aliyun_asr_client import AliyunAsrClient, aliyun_asr_is_enabled, aliyun_asr_is_preferred
     from .normalize import Segment, merge_timed_segments, normalize_timed_content
     from .serpapi_client import SerpApiClient, SerpApiError
     from .utils import detect_input_type, extract_video_id, format_timestamp, load_local_env, parse_serpapi_key, slugify
@@ -209,6 +211,57 @@ def build_runtime_client(client: Optional[Any], credential_root: Path) -> Any:
     if client is not None:
         return client
     return SerpApiClient(parse_serpapi_key(credential_root))
+
+
+def build_aliyun_asr_client(asr_client: Optional[Any], credential_root: Path) -> Optional[Any]:
+    load_local_env(credential_root)
+    if asr_client is not None:
+        return asr_client
+    if not aliyun_asr_is_enabled(credential_root):
+        return None
+    return AliyunAsrClient.from_environment(credential_root)
+
+
+def _fetch_aliyun_asr_probe(video_id: str, metadata: dict[str, Any], asr_client: Any) -> Any:
+    payload = asr_client.transcribe_youtube_video(video_id)
+    return type(
+        "Probe",
+        (),
+        {
+            "metadata": metadata,
+            "content_payload": payload,
+            "source_kind": "asr",
+            "origin": "aliyun_asr",
+        },
+    )()
+
+
+def fetch_best_timed_content_with_fallback(
+    video_id: str,
+    client: Any,
+    *,
+    language_code: str,
+    asr_client: Optional[Any],
+    credential_root: Path,
+) -> Any:
+    fallback_client = build_aliyun_asr_client(asr_client, credential_root)
+    if fallback_client is not None and aliyun_asr_is_preferred(credential_root):
+        metadata = client.metadata(video_id)
+        return _fetch_aliyun_asr_probe(video_id, metadata, fallback_client)
+
+    try:
+        return client.fetch_best_timed_content(video_id, language_code=language_code)
+    except Exception as primary_error:
+        if fallback_client is None:
+            raise
+        try:
+            metadata = client.metadata(video_id)
+            return _fetch_aliyun_asr_probe(video_id, metadata, fallback_client)
+        except Exception as fallback_error:
+            raise SerpApiError(
+                f"Unable to retrieve transcript for video {video_id}; "
+                f"Aliyun ASR fallback also failed: {fallback_error}"
+            ) from primary_error
 
 
 def parse_duration_seconds(value: Any) -> Optional[int]:
@@ -1026,11 +1079,19 @@ def resolve_single_video(
     *,
     language_code: str,
     search_limit: int,
+    asr_client: Optional[Any] = None,
+    credential_root: Path = REPO_ROOT,
 ) -> ResolvedVideo:
     input_type = detect_input_type(raw_input)
     if input_type in {"youtube_url", "video_id"}:
         video_id = extract_video_id(raw_input) or raw_input.strip()
-        probe = client.fetch_best_timed_content(video_id, language_code=language_code)
+        probe = fetch_best_timed_content_with_fallback(
+            video_id,
+            client,
+            language_code=language_code,
+            asr_client=asr_client,
+            credential_root=credential_root,
+        )
         parsed = parse_metadata(probe.metadata, video_id)
         candidate = VideoCandidate(
             video_id=video_id,
@@ -1052,7 +1113,13 @@ def resolve_single_video(
     last_error: Optional[Exception] = None
     for candidate in candidates:
         try:
-            probe = client.fetch_best_timed_content(candidate.video_id, language_code=language_code)
+            probe = fetch_best_timed_content_with_fallback(
+                candidate.video_id,
+                client,
+                language_code=language_code,
+                asr_client=asr_client,
+                credential_root=credential_root,
+            )
             parsed = parse_metadata(probe.metadata, candidate.video_id)
             candidate.title = parsed["title"]
             candidate.channel = parsed["channel"]
@@ -1217,13 +1284,17 @@ def fetch_transcript_context(
     search_limit: int = 5,
     run_id: str | None = None,
     client: Optional[Any] = None,
+    asr_client: Optional[Any] = None,
 ) -> Path:
+    credential_root = Path.cwd()
     runtime_client = build_runtime_client(client, Path.cwd())
     resolved = resolve_single_video(
         raw_input,
         runtime_client,
         language_code=language_code,
         search_limit=search_limit,
+        asr_client=asr_client,
+        credential_root=credential_root,
     )
     metadata = parse_metadata(resolved.metadata_payload, resolved.candidate.video_id)
     segments = merge_timed_segments(
@@ -1242,7 +1313,7 @@ def fetch_transcript_context(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "run_id": run_id,
         "input": raw_input,
-        "provider": "serpapi",
+        "provider": "aliyun_asr" if resolved.origin == "aliyun_asr" else "serpapi",
         "source_kind": resolved.source_kind,
         "origin": resolved.origin,
         "video": {
