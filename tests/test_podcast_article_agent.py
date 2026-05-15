@@ -23,10 +23,12 @@ from agents.podcast_article_agent import (
     extract_youtube_video_id,
     find_transcript_context,
     load_env_file,
+    normalize_youtube_timestamp_link_text,
     resolve_model,
     run_agent,
     serialize_message,
     should_prepare_discovery,
+    _sdk_error_message,
     write_run_manifest,
     write_sources_manifest,
 )
@@ -44,6 +46,13 @@ class FakeToolUse:
 class FakeMessage:
     content: list
     session_id: str = "session-1"
+
+
+@dataclass
+class FakeResultMessage:
+    is_error: bool = True
+    api_error_status: int | None = 402
+    result: str = "API Error: 402 Insufficient Balance"
 
 
 class PodcastArticleAgentTests(unittest.TestCase):
@@ -235,6 +244,11 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(payload["content"][0]["input"]["SERPAPI_API_KEY"], "<set>")
         self.assertNotIn("secret-value", str(payload))
 
+    def test_sdk_error_message_prefers_api_error_status(self) -> None:
+        message = FakeResultMessage()
+
+        self.assertEqual(_sdk_error_message(message), "API Error 402: Insufficient Balance")
+
     def test_log_sanitizer_preserves_usage_token_counts(self) -> None:
         payload = sanitize_for_log(
             {
@@ -262,6 +276,84 @@ class PodcastArticleAgentTests(unittest.TestCase):
             ready.write_text("{}", encoding="utf-8")
 
             self.assertEqual(find_transcript_context(transcript_dir), ready)
+
+    def test_normalize_youtube_timestamp_link_text_rewrites_visible_text_only(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "article.md"
+            article_path.write_text(
+                "\n".join(
+                    [
+                        "[▶ 01:29](https://www.youtube.com/watch?v=hmtuvNfytjM&t=89s)",
+                        "这是一句很长的正文说明，不应该被当成短介绍。[00:02:00](https://www.youtube.com/watch?v=hmtuvNfytjM&t=120s)",
+                        "短句但不是介绍。[00:03:00](https://www.youtube.com/watch?v=hmtuvNfytjM&t=180s)",
+                        "[姚顺宇谈模型同质化 07:05](https://www.youtube.com/watch?v=hmtuvNfytjM&amp;t=3723s)",
+                        "[source](https://www.youtube.com/watch?v=hmtuvNfytjM)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            replacement_count = normalize_youtube_timestamp_link_text(
+                article_path,
+                sources_manifest={
+                    "sources": [
+                        {
+                            "video_id": "hmtuvNfytjM",
+                            "title": "140. 对姚顺宇的4小时访谈：请允许我小疯一下",
+                            "channel": "Zhang Xiaojun Podcast",
+                        }
+                    ]
+                },
+            )
+            text = article_path.read_text(encoding="utf-8")
+
+        self.assertEqual(replacement_count, 4)
+        self.assertIn("(姚顺宇访谈 [00:01:29](https://www.youtube.com/watch?v=hmtuvNfytjM&t=89s))", text)
+        self.assertIn("(姚顺宇访谈 [00:02:00](https://www.youtube.com/watch?v=hmtuvNfytjM&t=120s))", text)
+        self.assertIn("(姚顺宇访谈 [00:03:00](https://www.youtube.com/watch?v=hmtuvNfytjM&t=180s))", text)
+        self.assertIn(
+            "(姚顺宇谈模型同质化 [01:02:03](https://www.youtube.com/watch?v=hmtuvNfytjM&amp;t=3723s))",
+            text,
+        )
+        self.assertIn("[source](https://www.youtube.com/watch?v=hmtuvNfytjM)", text)
+
+    def test_normalize_youtube_timestamp_link_text_is_idempotent_after_added_cue(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "article.md"
+            article_path.write_text(
+                '- 一条很长的列表正文，后面已有短介绍 (姚顺宇访谈 [00:09:23](https://www.youtube.com/watch?v=hmtuvNfytjM&t=563s))',
+                encoding="utf-8",
+            )
+
+            replacement_count = normalize_youtube_timestamp_link_text(
+                article_path,
+                sources_manifest={
+                    "sources": [
+                        {
+                            "video_id": "hmtuvNfytjM",
+                            "title": "140. 对姚顺宇的4小时访谈：请允许我小疯一下",
+                        }
+                    ]
+                },
+            )
+            text = article_path.read_text(encoding="utf-8")
+
+        self.assertEqual(replacement_count, 0)
+        self.assertEqual(text.count("姚顺宇访谈"), 1)
+
+    def test_normalize_youtube_timestamp_link_text_wraps_existing_short_cue(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "article.md"
+            article_path.write_text(
+                '已有短介绍 姚顺宇访谈 [00:09:23](https://www.youtube.com/watch?v=hmtuvNfytjM&t=563s)',
+                encoding="utf-8",
+            )
+
+            replacement_count = normalize_youtube_timestamp_link_text(article_path)
+            text = article_path.read_text(encoding="utf-8")
+
+        self.assertEqual(replacement_count, 1)
+        self.assertIn("(姚顺宇访谈 [00:09:23](https://www.youtube.com/watch?v=hmtuvNfytjM&t=563s))", text)
 
     def test_write_sources_manifest_filters_by_run_id(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -339,7 +431,10 @@ class PodcastArticleAgentTests(unittest.TestCase):
                 encoding="utf-8",
             )
             article_path.parent.mkdir(parents=True, exist_ok=True)
-            article_path.write_text("# Demo\n\n[`00:00`](https://www.youtube.com/watch?v=hmtuvNfytjM&t=0s)\n", encoding="utf-8")
+            article_path.write_text(
+                "# Demo\n\n[▶ start](https://www.youtube.com/watch?v=hmtuvNfytjM&t=0s)\n",
+                encoding="utf-8",
+            )
             await asyncio.sleep(0.05)
             yield object()
 
@@ -361,6 +456,7 @@ class PodcastArticleAgentTests(unittest.TestCase):
                     sources_manifest = json.loads((workspace_dir / "sources-manifest.json").read_text(encoding="utf-8"))
                     article_manifest = json.loads((article_path.parent / "article-manifest.json").read_text(encoding="utf-8"))
                     quality_report = json.loads((workspace_dir / "quality-report.json").read_text(encoding="utf-8"))
+                    article_text = article_path.read_text(encoding="utf-8")
 
         self.assertTrue(article_exists)
         self.assertEqual(run_manifest["status"], "completed")
@@ -372,9 +468,11 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(sources_manifest["sources"][0]["video_id"], "hmtuvNfytjM")
         self.assertTrue(sources_manifest["sources"][0]["referenced_in_article"])
         self.assertEqual(article_manifest["timestamp_link_count"], 1)
+        self.assertEqual(article_manifest["timestamp_link_text_issue_count"], 0)
         self.assertEqual(article_manifest["referenced_video_ids"], ["hmtuvNfytjM"])
         self.assertEqual(quality_report["status"], "passed")
         self.assertEqual(quality_report["issue_count"], 0)
+        self.assertIn("[00:00:00]", article_text)
         phases = [event["phase"] for event in events]
         self.assertIn("source_fetch", phases)
         self.assertIn("article_write", phases)

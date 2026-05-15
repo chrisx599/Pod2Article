@@ -185,7 +185,7 @@ Required adaptive wide-search workflow:
 5. Open and read every generated `.transcript.json` file before drafting.
 6. Create source coverage notes before drafting: for each transcript, identify the speaker/channel, role, whether it is direct first-person evidence or third-party analysis, main claims, and where it adds a distinct perspective. Use every usable in-scope direct transcript in the synthesis unless it is clearly off-topic; if a transcript is excluded, state the exclusion reason in the article.
 7. Synthesize across the gathered transcripts. Compare recurring claims, changes over time, disagreements, and caveats when the source material supports them. Do not let one long transcript dominate a broad-topic article when other usable transcripts are available.
-8. Write a coherent Markdown article that answers the research topic and includes clickable YouTube timestamp links. For broad-topic articles, the title, introduction, and conclusion must reflect the actual source breadth; do not frame the article as one person's view unless only one usable transcript was acquired. If the gathered evidence is mostly third-party analysis rather than the requested group's direct statements, narrow the title and introduction to that limitation instead of presenting it as the group's collective view.
+8. Write a coherent Markdown article that answers the research topic and includes clickable YouTube timestamp links. Put each timestamp citation in parentheses with a very short source or claim cue followed by a timestamp-only link, exactly like `(罗福莉谈框架自进化 [00:55:33](https://www.youtube.com/watch?v=...&t=3333s))`. Do not use labels such as `▶ 12:34`, source names, or sentence fragments as the visible text inside timestamp links. For broad-topic articles, the title, introduction, and conclusion must reflect the actual source breadth; do not frame the article as one person's view unless only one usable transcript was acquired. If the gathered evidence is mostly third-party analysis rather than the requested group's direct statements, narrow the title and introduction to that limitation instead of presenting it as the group's collective view.
 9. Do not create article drafts in any other directory. Do not expose hidden reasoning.
 
 Required outputs:
@@ -225,7 +225,7 @@ Required workflow:
    {fetch_command}
 2. Open and read the generated `.transcript.json` file before drafting.
 3. Use the complete transcript context as source evidence, including metadata, chapters, coverage, segments, and timestamp URLs.
-4. Write a coherent Markdown article that answers the research request and includes clickable YouTube timestamp links.
+4. Write a coherent Markdown article that answers the research request and includes clickable YouTube timestamp links. Put each timestamp citation in parentheses with a very short source or claim cue followed by a timestamp-only link, exactly like `(罗福莉谈框架自进化 [00:55:33](https://www.youtube.com/watch?v=...&t=3333s))`. Do not use labels such as `▶ 12:34`, source names, or sentence fragments as the visible text inside timestamp links.
 5. Do not create article drafts in any other directory. Do not expose hidden reasoning.
 
 Required outputs:
@@ -525,6 +525,246 @@ def _timestamp_link_count(text: str) -> int:
     return len(re.findall(r"https://(?:www\.)?(?:youtube\.com/watch\?[^)\s]+|youtu\.be/[^)\s]+)[^)\s]*(?:[?&]t=|&amp;t=)\d+s?", text))
 
 
+TIMESTAMP_MARKDOWN_LINK_RE = re.compile(
+    r"(?<!!)\[([^\]\n]+)\]\((https://(?:www\.)?(?:youtube\.com/watch\?[^)\s]+|youtu\.be/[^)\s]+)[^)\s]*)\)"
+)
+TIMESTAMP_CITATION_RE = re.compile(
+    r"(?P<intro>[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff_\-]{0,18})\s+"
+    r"\[(?P<label>\d{2}:\d{2}:\d{2})\]"
+    r"\((?P<url>https://(?:www\.)?(?:youtube\.com/watch\?[^)\s]+|youtu\.be/[^)\s]+)[^)\s]*)\)"
+)
+
+
+def _format_timestamp_text(seconds: int) -> str:
+    seconds = max(int(seconds), 0)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _parse_youtube_timestamp_value(value: str) -> int | None:
+    cleaned = value.strip().lower()
+    if not cleaned:
+        return None
+    if cleaned.endswith("s") and cleaned[:-1].isdigit():
+        return int(cleaned[:-1])
+    if cleaned.isdigit():
+        return int(cleaned)
+    match = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?", cleaned)
+    if not match or not any(match.groups()):
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _timestamp_seconds_from_youtube_url(url: str) -> int | None:
+    parsed = urlparse(url.replace("&amp;", "&"))
+    query = parse_qs(parsed.query)
+    values = query.get("t") or query.get("start")
+    if not values:
+        return None
+    return _parse_youtube_timestamp_value(values[0])
+
+
+def _video_id_from_youtube_url(url: str) -> str | None:
+    parsed = urlparse(url.replace("&amp;", "&"))
+    host = parsed.netloc.lower()
+    if "youtu.be" in host:
+        video_id = parsed.path.strip("/").split("/", 1)[0]
+        return video_id if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) else None
+    if "youtube.com" in host:
+        video_id = parse_qs(parsed.query).get("v", [None])[0]
+        return video_id if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) else None
+    return None
+
+
+GENERIC_TIMESTAMP_LINK_LABELS = {
+    "at",
+    "here",
+    "link",
+    "source",
+    "start",
+    "time",
+    "timestamp",
+    "video",
+    "watch",
+    "youtube",
+    "来源",
+    "链接",
+    "视频",
+    "时间",
+    "时间戳",
+}
+
+
+def _timestamp_link_intro(label: str, expected_label: str) -> str:
+    cleaned = label.strip().strip("`").strip()
+    cleaned = cleaned.replace(expected_label, " ")
+    cleaned = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " ", cleaned)
+    cleaned = re.sub(r"\b\d+\s*s\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[\s:：,，.。;；|｜\-–—▶▷►]+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if cleaned.lower() in GENERIC_TIMESTAMP_LINK_LABELS:
+        return ""
+    return cleaned
+
+
+def _source_cue_from_title(title: str | None, channel: str | None = None) -> str:
+    value = re.sub(r"\s+", " ", (title or "").strip())
+    match = re.search(r"对([^的：:，,|丨\-\s]{1,8})的.{0,4}访谈", value)
+    if match:
+        return f"{match.group(1)}访谈"
+    value = re.sub(r"^\s*\d+\s*[.、:：-]\s*", "", value)
+    value = re.split(r"[|丨:：\-—]", value, maxsplit=1)[0].strip()
+    if re.search(r"[\u4e00-\u9fff]", value):
+        return value[:10] if value else "视频片段"
+    words = re.findall(r"[A-Za-z0-9]+", value)
+    if words:
+        return " ".join(words[:3])
+    channel_value = re.sub(r"\s+", " ", (channel or "").strip())
+    return channel_value[:16] if channel_value else "视频片段"
+
+
+def _source_cues_from_manifest(sources_manifest: dict[str, object] | None) -> dict[str, str]:
+    sources = (sources_manifest or {}).get("sources")
+    if not isinstance(sources, list):
+        return {}
+    cues: dict[str, str] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        video_id = source.get("video_id")
+        if not isinstance(video_id, str) or not video_id:
+            continue
+        title = source.get("title") if isinstance(source.get("title"), str) else None
+        channel = source.get("channel") if isinstance(source.get("channel"), str) else None
+        cues[video_id] = _source_cue_from_title(title, channel)
+    return cues
+
+
+def _line_prefix_has_timestamp_intro(text: str, link_start: int) -> bool:
+    line_start = text.rfind("\n", 0, link_start) + 1
+    prefix = text[line_start:link_start].strip()
+    prefix = re.sub(r"^[>\-\*\d.)\s]+", "", prefix).strip()
+    prefix = re.sub(r"[，,。.;；:：|｜\-–—▶▷►\s]+$", "", prefix).strip()
+    prefix = re.split(r"[。！？!?；;]|\)\s*", prefix)[-1].strip()
+    if len(prefix) > 18:
+        prefix = re.split(r"\s+", prefix)[-1].strip()
+    prefix = prefix.strip("*_` ")
+    if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", prefix):
+        return False
+    if len(prefix) > 18:
+        return False
+    return not bool(re.search(r"[，,。！？!?；;:：]", prefix))
+
+
+def _is_timestamp_citation_wrapped(text: str, link_start: int, link_end: int) -> bool:
+    line_start = text.rfind("\n", 0, link_start) + 1
+    prefix = text[line_start:link_start]
+    open_paren = prefix.rfind("(")
+    if open_paren == -1:
+        return False
+    intro = prefix[open_paren + 1 :].strip()
+    if not intro or len(intro) > 18:
+        return False
+    if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", intro):
+        return False
+    if re.search(r"[，,。！？!?；;:：()\[\]]", intro):
+        return False
+    suffix = text[link_end:]
+    return suffix.startswith(")")
+
+
+def _wrap_timestamp_citations(text: str) -> tuple[str, int]:
+    replacement_count = 0
+
+    def replace_citation(match: re.Match[str]) -> str:
+        nonlocal replacement_count
+        seconds = _timestamp_seconds_from_youtube_url(match.group("url"))
+        if seconds is None or match.group("label") != _format_timestamp_text(seconds):
+            return match.group(0)
+        if _is_timestamp_citation_wrapped(text, match.start("label") - 1, match.end()):
+            return match.group(0)
+        replacement_count += 1
+        return f"({match.group(0)})"
+
+    return TIMESTAMP_CITATION_RE.sub(replace_citation, text), replacement_count
+
+
+def normalize_youtube_timestamp_link_text(
+    article_path: Path,
+    *,
+    sources_manifest: dict[str, object] | None = None,
+) -> int:
+    if not article_path.exists():
+        return 0
+    text = article_path.read_text(encoding="utf-8", errors="replace")
+    replacement_count = 0
+    source_cues = _source_cues_from_manifest(sources_manifest)
+
+    def replace_link(match: re.Match[str]) -> str:
+        nonlocal replacement_count
+        label = match.group(1)
+        url = match.group(2)
+        seconds = _timestamp_seconds_from_youtube_url(url)
+        if seconds is None:
+            return match.group(0)
+        expected_label = _format_timestamp_text(seconds)
+        if label == expected_label:
+            intro = ""
+            if not _is_timestamp_citation_wrapped(text, match.start(), match.end()):
+                previous_char = text[match.start() - 1] if match.start() > 0 else ""
+                if previous_char and not previous_char.isspace():
+                    video_id = _video_id_from_youtube_url(url)
+                    if video_id:
+                        intro = source_cues.get(video_id, "")
+        else:
+            intro = _timestamp_link_intro(label, expected_label)
+        if not intro and not _line_prefix_has_timestamp_intro(text, match.start()):
+            video_id = _video_id_from_youtube_url(url)
+            if video_id:
+                intro = source_cues.get(video_id, "")
+        if label == expected_label and not intro:
+            return match.group(0)
+        replacement_count += 1
+        if intro:
+            return f"({intro} [{expected_label}]({url}))"
+        return f"[{expected_label}]({url})"
+
+    normalized = TIMESTAMP_MARKDOWN_LINK_RE.sub(replace_link, text)
+    normalized, wrapped_count = _wrap_timestamp_citations(normalized)
+    replacement_count += wrapped_count
+    if normalized != text:
+        article_path.write_text(normalized, encoding="utf-8")
+    return replacement_count
+
+
+def _timestamp_link_text_issue_count(text: str) -> int:
+    issue_count = 0
+    for match in TIMESTAMP_MARKDOWN_LINK_RE.finditer(text):
+        seconds = _timestamp_seconds_from_youtube_url(match.group(2))
+        if seconds is None:
+            continue
+        if match.group(1) != _format_timestamp_text(seconds):
+            issue_count += 1
+    return issue_count
+
+
+def _timestamp_link_intro_issue_count(text: str) -> int:
+    issue_count = 0
+    for match in TIMESTAMP_MARKDOWN_LINK_RE.finditer(text):
+        if _timestamp_seconds_from_youtube_url(match.group(2)) is None:
+            continue
+        if not _line_prefix_has_timestamp_intro(text, match.start()):
+            issue_count += 1
+            continue
+        if not _is_timestamp_citation_wrapped(text, match.start(), match.end()):
+            issue_count += 1
+    return issue_count
+
+
 def _article_word_count(text: str) -> int:
     ascii_words = re.findall(r"[A-Za-z0-9_]+", text)
     cjk_chars = re.findall(r"[\u4e00-\u9fff]", text)
@@ -558,6 +798,8 @@ def write_article_manifest(
         "chars": len(text),
         "word_count": _article_word_count(text),
         "timestamp_link_count": _timestamp_link_count(text),
+        "timestamp_link_text_issue_count": _timestamp_link_text_issue_count(text),
+        "timestamp_link_intro_issue_count": _timestamp_link_intro_issue_count(text),
         "referenced_video_ids": article_video_ids,
         "referenced_video_count": len(article_video_ids),
         "transcript_video_ids": transcript_video_ids,
@@ -587,6 +829,8 @@ def write_quality_report(
     search_count = int(sources_manifest.get("search_count") or 0)
     transcript_count = int(sources_manifest.get("transcript_count") or 0)
     timestamp_link_count = int((article_manifest or {}).get("timestamp_link_count") or 0)
+    timestamp_link_text_issue_count = int((article_manifest or {}).get("timestamp_link_text_issue_count") or 0)
+    timestamp_link_intro_issue_count = int((article_manifest or {}).get("timestamp_link_intro_issue_count") or 0)
     referenced_ids = set((article_manifest or {}).get("referenced_video_ids") or [])
     transcript_ids = set((article_manifest or {}).get("transcript_video_ids") or [])
 
@@ -596,6 +840,18 @@ def write_quality_report(
         add_issue("error", "no_transcripts", "No transcript artifacts were generated for this run.")
     if article_path.exists() and article_path.stat().st_size > 0 and timestamp_link_count < 1:
         add_issue("warning", "no_timestamp_links", "Article does not contain clickable YouTube timestamp links.")
+    if timestamp_link_text_issue_count:
+        add_issue(
+            "warning",
+            "timestamp_link_text_inconsistent",
+            "Some YouTube timestamp links do not use HH:MM:SS as their visible text.",
+        )
+    if timestamp_link_intro_issue_count:
+        add_issue(
+            "warning",
+            "timestamp_link_intro_missing",
+            "Some YouTube timestamp links do not have a short source or claim cue immediately before them.",
+        )
     if research_mode == "wide":
         if search_count < 2:
             add_issue("warning", "wide_search_count_low", "Wide mode produced fewer than two search artifacts.")
@@ -631,6 +887,8 @@ def write_quality_report(
         "search_count": search_count,
         "transcript_count": transcript_count,
         "timestamp_link_count": timestamp_link_count,
+        "timestamp_link_text_issue_count": timestamp_link_text_issue_count,
+        "timestamp_link_intro_issue_count": timestamp_link_intro_issue_count,
         "referenced_video_count": len(referenced_ids),
         "referenced_without_transcript": missing_transcripts,
         "issues": issues,
@@ -784,6 +1042,29 @@ def _iter_text_blocks(message: object) -> Iterable[str]:
         result = getattr(message, "result", None)
         if result:
             yield str(result)
+
+
+def _sdk_error_message(message: object) -> str | None:
+    is_error = bool(getattr(message, "is_error", False))
+    status = getattr(message, "api_error_status", None)
+    result = getattr(message, "result", None)
+    if not is_error and not status:
+        return None
+    result_text = str(result).strip() if result else ""
+    if status:
+        prefix = f"API Error {status}"
+        if result_text.lower().startswith("api error:"):
+            detail = result_text.split(":", 1)[1].strip()
+            detail = re.sub(rf"^{re.escape(str(status))}\s*", "", detail).strip()
+            return f"{prefix}: {detail}" if detail else prefix
+        if result_text:
+            return f"{prefix}: {result_text}"
+        return prefix
+    return result_text or None
+
+
+class AgentRunError(RuntimeError):
+    pass
 
 
 def _emit_progress(
@@ -1053,14 +1334,17 @@ async def run_agent(
             stop_event=stop_event,
         )
     )
+    sdk_error_message: str | None = None
     try:
         async for message in query(prompt=prompt, options=options):
+            sdk_error_message = _sdk_error_message(message) or sdk_error_message
             logger.info(format_log_event("sdk_message", serialize_message(message)))
             for text in _iter_text_blocks(message):
                 logger.info(format_log_text_block("message_text", text))
                 print(text)
     except Exception as exc:
-        logger.exception(format_log_event("agent_failed"))
+        error_message = sdk_error_message or str(exc)
+        logger.exception(format_log_event("agent_failed", {"error_message": error_message}))
         write_artifact_reports(
             sources_manifest_path=sources_manifest_path,
             article_manifest_path=article_manifest_path,
@@ -1083,14 +1367,14 @@ async def run_agent(
             paths=paths,
             article_path=article_path,
             run_id=run_id,
-            error_message=str(exc),
+            error_message=error_message,
             sources_manifest_path=sources_manifest_path,
             article_manifest_path=article_manifest_path,
             quality_report_path=quality_report_path,
             **discovery_report_paths,
         )
-        _emit_progress(progress_sink, "task_failed", "failed", "任务失败")
-        raise
+        _emit_progress(progress_sink, "task_failed", "failed", "任务失败", data={"error_message": error_message})
+        raise AgentRunError(error_message) from exc
     finally:
         stop_event.set()
         await artifact_watcher
@@ -1108,14 +1392,17 @@ async def run_agent(
                 {"transcript_path": str(transcript_path), "article_path": str(article_path)},
             )
         )
+        retry_sdk_error_message: str | None = None
         try:
             async for message in query(prompt=retry_prompt, options=options):
+                retry_sdk_error_message = _sdk_error_message(message) or retry_sdk_error_message
                 logger.info(format_log_event("sdk_message", serialize_message(message)))
                 for text in _iter_text_blocks(message):
                     logger.info(format_log_text_block("message_text", text))
                     print(text)
         except Exception as exc:
-            logger.exception(format_log_event("article_retry_failed"))
+            error_message = retry_sdk_error_message or str(exc)
+            logger.exception(format_log_event("article_retry_failed", {"error_message": error_message}))
             write_artifact_reports(
                 sources_manifest_path=sources_manifest_path,
                 article_manifest_path=article_manifest_path,
@@ -1138,13 +1425,13 @@ async def run_agent(
                 paths=paths,
                 article_path=article_path,
                 run_id=run_id,
-                error_message=str(exc),
+                error_message=error_message,
                 sources_manifest_path=sources_manifest_path,
                 article_manifest_path=article_manifest_path,
                 quality_report_path=quality_report_path,
                 **discovery_report_paths,
             )
-            raise
+            raise AgentRunError(error_message) from exc
 
     if not article_path.exists() or article_path.stat().st_size == 0:
         write_artifact_reports(
@@ -1176,6 +1463,28 @@ async def run_agent(
             **discovery_report_paths,
         )
         raise RuntimeError("agent stopped before writing article.md")
+
+    pre_normalize_sources_manifest = write_sources_manifest(
+        sources_manifest_path,
+        search_dir=paths["search_dir"],
+        transcript_dir=paths["transcript_dir"],
+        article_path=article_path,
+        run_id=run_id,
+    )
+    normalized_timestamp_link_count = normalize_youtube_timestamp_link_text(
+        article_path,
+        sources_manifest=pre_normalize_sources_manifest,
+    )
+    if normalized_timestamp_link_count:
+        logger.info(
+            format_log_event(
+                "timestamp_links_normalized",
+                {
+                    "article_path": str(article_path),
+                    "normalized_count": normalized_timestamp_link_count,
+                },
+            )
+        )
 
     sources_manifest, article_manifest, quality_report = write_artifact_reports(
         sources_manifest_path=sources_manifest_path,
@@ -1216,6 +1525,7 @@ async def run_agent(
             "article_manifest_path": str(article_manifest_path),
             "quality_report_path": str(quality_report_path),
             "transcript_count": sources_manifest.get("transcript_count"),
+            "normalized_timestamp_link_count": normalized_timestamp_link_count,
             "quality_status": quality_report.get("status"),
         },
     )
