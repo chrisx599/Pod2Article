@@ -54,6 +54,11 @@ class SerpApiClient:
         request_params.update(params)
         return self._request(request_params)
 
+    def web_search(self, query: str, **params: Any) -> dict[str, Any]:
+        request_params = {"engine": "google", "q": query}
+        request_params.update(params)
+        return self._request(request_params)
+
     def metadata(self, video_id: str) -> dict[str, Any]:
         return self._request({"engine": "youtube_video", "v": video_id})
 

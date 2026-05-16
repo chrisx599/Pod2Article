@@ -35,6 +35,9 @@ The runner writes runtime data under `output/agent/<source-id>/`:
 
 ```text
 query-plan.json
+web-search/*.web-search.json
+web-search/web-search-manifest.json
+web-search/web-evidence.json
 transcript-fetch-plan.json
 transcript-fetch-manifest.json
 transcripts/*.transcript.json
@@ -224,6 +227,8 @@ Search YouTube:
 ```bash
 python3 podcast-to-article/scripts/search_youtube.py "lex fridman vikings" --output-dir search-results
 ```
+
+In wide mode, the agent also uses SerpApi Google Web Search through the same `SERPAPI_API_KEY`. Web results are saved as compact snippet-level background evidence under `web-search/`; YouTube transcript evidence remains the primary article source.
 
 Fetch complete transcript context:
 

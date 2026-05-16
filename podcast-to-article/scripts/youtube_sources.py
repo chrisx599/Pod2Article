@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from urllib.parse import urlparse
 
 if __package__ in {None, ""}:
     CURRENT_DIR = Path(__file__).resolve().parent
@@ -31,154 +32,13 @@ CODE_ROOT = SCRIPT_DIR.parent
 REPO_ROOT = CODE_ROOT.parent
 SEARCH_QUERY_HASH_LENGTH = 8
 SEARCH_MANIFEST_FILENAME = "search-manifest.json"
+WEB_SEARCH_MANIFEST_FILENAME = "web-search-manifest.json"
 RESEARCH_PLAN_FILENAME = "research-plan.json"
 VIDEO_ENRICHMENT_MANIFEST_FILENAME = "video-enrichment-manifest.json"
 SELECTION_MANIFEST_FILENAME = "selection-manifest.json"
 DEFAULT_DISCOVERY_QUERY_COUNT = 4
 DEFAULT_DISCOVERY_ENRICHMENT_LIMIT = 14
 DEFAULT_SELECTION_CANDIDATE_LIMIT = 18
-LATIN_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "by",
-    "for",
-    "from",
-    "has",
-    "in",
-    "is",
-    "it",
-    "its",
-    "of",
-    "on",
-    "or",
-    "the",
-    "to",
-    "was",
-    "were",
-    "will",
-    "with",
-}
-PREFERRED_SOURCE_TERMS = {
-    "conversation",
-    "discussion",
-    "fireside",
-    "interview",
-    "keynote",
-    "lecture",
-    "panel",
-    "podcast",
-    "talk",
-    "对谈",
-    "访谈",
-    "采访",
-    "播客",
-    "演讲",
-    "圆桌",
-    "专访",
-}
-NOISY_SOURCE_TERMS = {
-    "clip",
-    "clips",
-    "highlight",
-    "highlights",
-    "reaction",
-    "reacts",
-    "short",
-    "shorts",
-    "teaser",
-    "trailer",
-}
-DIRECT_SOURCE_TERMS = {
-    "conversation",
-    "dialogue",
-    "interview",
-    "keynote",
-    "speech",
-    "talk",
-    "with",
-    "对话",
-    "访谈",
-    "采访",
-    "演讲",
-    "专访",
-}
-THIRD_PARTY_ANALYSIS_TERMS = {
-    "analysis",
-    "analyst",
-    "battle",
-    "breakthrough",
-    "documentary",
-    "explained",
-    "explains",
-    "race",
-    "rivalry",
-    "war",
-    "winning",
-    "解读",
-    "分析",
-    "纪录片",
-    "赶超",
-    "竞争",
-}
-CHINA_TOPIC_TERMS = {"china", "chinese", "中国", "国产", "华人"}
-LEADER_TOPIC_TERMS = {
-    "boss",
-    "ceo",
-    "entrepreneur",
-    "founder",
-    "leader",
-    "leaders",
-    "大佬",
-    "企业家",
-    "创始人",
-    "领袖",
-}
-CHINESE_LEADER_SIGNAL_TERMS = {
-    "01",
-    "alibaba",
-    "baichuan",
-    "baidu",
-    "bytedance",
-    "deepseek",
-    "huawei",
-    "kimi",
-    "minimax",
-    "moonshot",
-    "qwen",
-    "sensetime",
-    "tencent",
-    "tsai",
-    "wang",
-    "xiaochuan",
-    "zhipu",
-    "zhang",
-    "阿里",
-    "百度",
-    "百川",
-    "蔡崇信",
-    "大模型",
-    "华为",
-    "李开复",
-    "梁建章",
-    "梁文锋",
-    "零一",
-    "商汤",
-    "深度求索",
-    "腾讯",
-    "王小川",
-    "月之暗面",
-    "张亚勤",
-    "智谱",
-    "周鸿祎",
-    "字节",
-}
-
-
 @dataclass
 class VideoCandidate:
     video_id: str
@@ -403,7 +263,7 @@ def _search_tokens(value: str) -> set[str]:
     for match in re.finditer(r"[a-z0-9]+|[\u3400-\u9fff]+", value.lower()):
         text = match.group(0)
         if re.fullmatch(r"[a-z0-9]+", text):
-            if len(text) > 1 and text not in LATIN_STOPWORDS:
+            if len(text) > 1:
                 tokens.add(text)
             continue
         if len(text) <= 4:
@@ -465,41 +325,6 @@ def _duration_bonus(duration_sec: Optional[int]) -> float:
     return 0.9
 
 
-def _source_format_bonus(title: str, description: str, query_terms: set[str]) -> float:
-    searchable = f"{title} {description}".lower()
-    terms = _search_tokens(searchable)
-    bonus = 0.8 if terms & PREFERRED_SOURCE_TERMS else 0.0
-    noisy_terms = terms & NOISY_SOURCE_TERMS
-    if noisy_terms and not noisy_terms & query_terms:
-        bonus -= 1.2
-    return bonus
-
-
-def _direct_leader_source_bonus(title: str, channel: str, description: str, query_terms: set[str]) -> float:
-    terms = _search_tokens(f"{title} {channel} {description}")
-    direct_query_terms = LEADER_TOPIC_TERMS | DIRECT_SOURCE_TERMS | PREFERRED_SOURCE_TERMS
-    if not query_terms & CHINA_TOPIC_TERMS or not query_terms & direct_query_terms:
-        return 0.0
-
-    bonus = 0.0
-    leader_signal = terms & CHINESE_LEADER_SIGNAL_TERMS
-    if terms & DIRECT_SOURCE_TERMS:
-        bonus += 1.4
-    if leader_signal:
-        bonus += 1.2
-    if terms & LEADER_TOPIC_TERMS:
-        bonus += 0.8
-
-    third_party_terms = terms & THIRD_PARTY_ANALYSIS_TERMS
-    if not leader_signal and not terms & DIRECT_SOURCE_TERMS and not terms & LEADER_TOPIC_TERMS:
-        bonus -= 1.0
-    if third_party_terms and not terms & DIRECT_SOURCE_TERMS and not leader_signal:
-        bonus -= 2.2
-    if third_party_terms and not terms & LEADER_TOPIC_TERMS and not leader_signal:
-        bonus -= 0.8
-    return bonus
-
-
 def _candidate_score_breakdown(
     *,
     query_terms: set[str],
@@ -518,8 +343,6 @@ def _candidate_score_breakdown(
         "description_match": round(_term_overlap_score(query_terms, description, 0.55), 4),
         "duration_bonus": round(_duration_bonus(duration_sec), 4),
         "views_bonus": round(_views_bonus(views), 4),
-        "source_format_bonus": round(_source_format_bonus(title, description, query_terms), 4),
-        "direct_source_bonus": round(_direct_leader_source_bonus(title, channel, description, query_terms), 4),
     }
 
 
@@ -772,38 +595,29 @@ def _candidate_from_payload(payload: dict[str, Any]) -> Optional[VideoCandidate]
 
 
 def build_research_queries(input_value: str, question: str, *, research_mode: str = "wide") -> list[dict[str, Any]]:
-    topic = re.sub(r"\s+", " ", (question or input_value).strip())
-    compact = re.sub(
-        r"(请|帮我|调研|研究|写一篇|文章|深度|总结|关于|please|write|research|article|summarize)",
-        " ",
-        topic,
-        flags=re.IGNORECASE,
-    )
-    compact = re.sub(r"\s+", " ", compact).strip() or topic
-    base_terms = [compact]
+    base_terms = []
     if input_value.strip() and input_value.strip() != question.strip() and detect_input_type(input_value) == "search_query":
-        base_terms.insert(0, input_value.strip())
+        base_terms.append(input_value.strip())
+    topic = re.sub(r"\s+", " ", (question or input_value).strip())
+    if topic:
+        base_terms.append(topic)
 
-    suffixes = ["访谈 podcast", "interview talk", "panel keynote"]
-    if re.search(r"[\u3400-\u9fff]", topic):
-        suffixes.insert(0, "对谈 访谈 演讲")
     queries: list[dict[str, Any]] = []
     for base in base_terms:
-        for suffix in suffixes:
-            query = canonicalize_search_query(f"{base} {suffix}")
-            if not query or any(item["query"] == query for item in queries):
-                continue
-            queries.append(
-                {
-                    "round": 1,
-                    "query": query,
-                    "intent": "discover direct long-form YouTube sources",
-                    "expected_source_type": "interview/podcast/talk/panel/keynote",
-                    "language": "mixed",
-                }
-            )
-            if len(queries) >= DEFAULT_DISCOVERY_QUERY_COUNT:
-                return queries
+        query = canonicalize_search_query(base)
+        if not query or any(item["query"] == query for item in queries):
+            continue
+        queries.append(
+            {
+                "round": 1,
+                "query": query,
+                "intent": "fallback discovery query",
+                "expected_source_type": "model-planned or user-supplied",
+                "language": "mixed",
+            }
+        )
+        if len(queries) >= DEFAULT_DISCOVERY_QUERY_COUNT:
+            return queries
     return queries
 
 
@@ -850,6 +664,178 @@ def _write_json(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def _domain_from_url(value: str) -> str:
+    try:
+        host = urlparse(value).netloc.lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _compact_string(value: Any) -> str:
+    if isinstance(value, str):
+        return re.sub(r"\s+", " ", value).strip()
+    if isinstance(value, list):
+        return re.sub(r"\s+", " ", " ".join(str(item) for item in value)).strip()
+    return ""
+
+
+def normalize_web_search_results(payload: dict[str, Any], query: str, *, limit: int = 12) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    rank = 0
+    for bucket in ("organic_results", "news_results", "top_stories"):
+        raw_items = payload.get(bucket)
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            title = _compact_string(item.get("title"))
+            link = _compact_string(item.get("link") or item.get("url") or item.get("source_link"))
+            if not title or not link:
+                continue
+            rank += 1
+            source = _compact_string(item.get("source") or item.get("displayed_link")) or _domain_from_url(link)
+            snippet = _compact_string(
+                item.get("snippet")
+                or item.get("description")
+                or item.get("summary")
+                or item.get("snippet_highlighted_words")
+            )
+            date = _compact_string(item.get("date") or item.get("published") or item.get("publication_date"))
+            position = item.get("position") or item.get("position_on_page") or rank
+            results.append(
+                {
+                    "rank": rank,
+                    "position": position,
+                    "result_type": bucket,
+                    "query": query,
+                    "title": title,
+                    "url": link,
+                    "source": source,
+                    "date": date,
+                    "snippet": snippet,
+                }
+            )
+            if len(results) >= limit:
+                return results
+    return results
+
+
+def unique_web_search_output_path(query: str, *, output_dir: Path, query_hash: str) -> Path:
+    stem = f"{slugify(query, fallback='web-search')}-{query_hash}"
+    candidate = output_dir / f"{stem}.web-search.json"
+    if not candidate.exists():
+        return candidate
+    index = 2
+    while True:
+        candidate = output_dir / f"{stem}-{index}.web-search.json"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def raw_web_search_output_path(web_search_output_path: Path) -> Path:
+    name = web_search_output_path.name
+    if name.endswith(".web-search.json"):
+        return web_search_output_path.with_name(f"{name.removesuffix('.web-search.json')}.raw-web-search.json")
+    return web_search_output_path.with_suffix(".raw-web-search.json")
+
+
+def append_web_search_manifest(output_dir: Path, entry: dict[str, Any]) -> Path:
+    manifest_path = output_dir / WEB_SEARCH_MANIFEST_FILENAME
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        if not isinstance(manifest, dict):
+            manifest = {}
+    else:
+        manifest = {}
+
+    searches = manifest.get("searches")
+    if not isinstance(searches, list):
+        searches = []
+
+    now = datetime.now(timezone.utc).isoformat()
+    searches.append({"round": len(searches) + 1, **entry})
+    manifest.update(
+        {
+            "schema_version": 1,
+            "generated_at": manifest.get("generated_at") or now,
+            "updated_at": now,
+            "search_dir": str(output_dir),
+            "search_count": len(searches),
+            "searches": searches,
+        }
+    )
+    return _write_json(manifest_path, manifest)
+
+
+def write_web_search_artifacts(
+    *,
+    query: str,
+    payload: dict[str, Any],
+    output_dir: Path,
+    run_id: str | None = None,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    canonical_query = canonicalize_search_query(query)
+    query_hash = hashlib.sha256(canonical_query.encode("utf-8")).hexdigest()[:SEARCH_QUERY_HASH_LENGTH]
+    destination = unique_web_search_output_path(canonical_query, output_dir=output_dir, query_hash=query_hash)
+    raw_destination = raw_web_search_output_path(destination)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    results = normalize_web_search_results(payload, query)
+    _write_json(
+        raw_destination,
+        {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "run_id": run_id,
+            "query": query,
+            "canonical_query": canonical_query,
+            "query_hash": query_hash,
+            "provider": "serpapi",
+            "engine": "google",
+            "payload": payload,
+        },
+    )
+    _write_json(
+        destination,
+        {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "run_id": run_id,
+            "query": query,
+            "canonical_query": canonical_query,
+            "query_hash": query_hash,
+            "provider": "serpapi",
+            "engine": "google",
+            "raw_output_path": str(raw_destination),
+            "result_count": len(results),
+            "results": results,
+        },
+    )
+    append_web_search_manifest(
+        output_dir,
+        {
+            "created_at": generated_at,
+            "run_id": run_id,
+            "query": query,
+            "canonical_query": canonical_query,
+            "query_hash": query_hash,
+            "provider": "serpapi",
+            "engine": "google",
+            "output_path": str(destination),
+            "raw_output_path": str(raw_destination),
+            "result_count": len(results),
+            "top_urls": [str(item.get("url")) for item in results[:5] if item.get("url")],
+        },
+    )
+    return destination
 
 
 def write_search_artifacts(
@@ -927,6 +913,7 @@ def prepare_research_discovery(
     max_search_rounds: int = 2,
     enrichment_limit: int = DEFAULT_DISCOVERY_ENRICHMENT_LIMIT,
     selection_candidate_limit: int = DEFAULT_SELECTION_CANDIDATE_LIMIT,
+    planned_queries: Optional[list[dict[str, Any]]] = None,
     client: Optional[Any] = None,
 ) -> dict[str, Path]:
     runtime_client = build_runtime_client(client, Path.cwd())
@@ -934,7 +921,11 @@ def prepare_research_discovery(
     search_dir.mkdir(parents=True, exist_ok=True)
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
-    planned_queries = build_research_queries(input_value, question, research_mode=research_mode)
+    planned_queries = (
+        [dict(item) for item in planned_queries]
+        if planned_queries is not None
+        else build_research_queries(input_value, question, research_mode=research_mode)
+    )
     plan_path = workspace_dir / RESEARCH_PLAN_FILENAME
     _write_json(
         plan_path,
@@ -1143,6 +1134,20 @@ def search_youtube_context(
     runtime_client = build_runtime_client(client, Path.cwd())
     payload = runtime_client.search(query)
     return write_search_artifacts(query=query, payload=payload, output_dir=output_dir, run_id=run_id)
+
+
+def search_web_context(
+    query: str,
+    *,
+    output_dir: Path,
+    run_id: str | None = None,
+    client: Optional[Any] = None,
+) -> Path:
+    runtime_client = build_runtime_client(client, Path.cwd())
+    if not hasattr(runtime_client, "web_search"):
+        raise SerpApiError("Runtime client does not support SerpApi web_search.")
+    payload = runtime_client.web_search(query)
+    return write_web_search_artifacts(query=query, payload=payload, output_dir=output_dir, run_id=run_id)
 
 
 def canonicalize_search_query(query: str) -> str:

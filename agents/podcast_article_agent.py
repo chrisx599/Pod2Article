@@ -68,18 +68,24 @@ SELECTION_MANIFEST_FILENAME = "selection-manifest.json"
 EVIDENCE_DIRNAME = "evidence"
 EVIDENCE_MANIFEST_FILENAME = "evidence-manifest.json"
 EVIDENCE_MAX_CONCURRENCY = 3
+WEB_SEARCH_DIRNAME = "web-search"
+WEB_EVIDENCE_FILENAME = "web-evidence.json"
+WEB_EVIDENCE_MAX_CARDS = 12
 TRANSCRIPT_FETCH_PLAN_FILENAME = "transcript-fetch-plan.json"
 TRANSCRIPT_FETCH_MANIFEST_FILENAME = "transcript-fetch-manifest.json"
 QUERY_PLAN_FILENAME = "query-plan.json"
+INITIAL_SEARCH_QUERY_PLAN_FILENAME = "initial-search-query-plan.json"
+INITIAL_DISCOVERY_QUERY_COUNT = 4
 WIDE_TRANSCRIPT_TARGET_COUNT = 10
 WIDE_TRANSCRIPT_PROBE_LIMIT = 18
 WIDE_TRANSCRIPT_MAX_CONCURRENCY = 4
 WIDE_SUPPLEMENTAL_QUERY_COUNT = 4
+WIDE_SUPPLEMENTAL_WEB_QUERY_COUNT = 4
 WIDE_SUPPLEMENTAL_SEARCH_MAX_CONCURRENCY = 4
 PODCAST_SCRIPTS_DIR = PROJECT_ROOT / "podcast-to-article" / "scripts"
 if str(PODCAST_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(PODCAST_SCRIPTS_DIR))
-from youtube_sources import fetch_transcript_context, prepare_research_discovery, search_youtube_context  # noqa: E402
+from youtube_sources import fetch_transcript_context, prepare_research_discovery, search_web_context, search_youtube_context  # noqa: E402
 
 
 def default_log_path() -> Path:
@@ -122,6 +128,7 @@ def build_workspace_paths(output_root: Path, source_id: str) -> dict[str, Path]:
     return {
         "workspace_dir": workspace_dir,
         "search_dir": workspace_dir / "search-results",
+        "web_search_dir": workspace_dir / WEB_SEARCH_DIRNAME,
         "transcript_dir": workspace_dir / "transcripts",
         "evidence_dir": workspace_dir / EVIDENCE_DIRNAME,
         "articles_root": workspace_dir / "articles",
@@ -164,7 +171,7 @@ def build_prompt(
     run_id_block = f"\nUse this exact run id:\n{run_id}\n" if run_id else ""
     if research_mode == "wide" or selection_manifest_path:
         fetch_plan_path = transcript_fetch_plan_path or str(Path(workspace_dir) / TRANSCRIPT_FETCH_PLAN_FILENAME)
-        return f"""Use the {SKILL_NAME} skill. Plan only supplemental YouTube search queries for a grounded wide video deep research article.
+        return f"""Use the {SKILL_NAME} skill. Plan only supplemental YouTube and Web search queries for a grounded wide video deep research article.
 
 Research topic:
 {question}
@@ -191,15 +198,19 @@ The Python runner, not you, will write the transcript fetch plan here:
 Required workflow:
 1. Do not run Bash, Read, Write, search tools, or transcript fetchers.
 2. Return only a compact JSON object in your final message.
-3. Propose up to {WIDE_SUPPLEMENTAL_QUERY_COUNT} targeted supplemental YouTube search queries that would improve source breadth for this research topic.
+3. Propose up to {WIDE_SUPPLEMENTAL_QUERY_COUNT} targeted supplemental YouTube search queries and up to {WIDE_SUPPLEMENTAL_WEB_QUERY_COUNT} targeted Web search queries that would improve source breadth for this research topic.
 4. Focus on semantic gaps that generic search may miss: specific speakers, organizations, roles, English/Chinese balance, panels, podcasts, keynotes, or recency.
-5. Do not select videos and do not write transcript-fetch-plan.json; the Python runner will execute your queries, merge candidates, and fetch transcripts in parallel.
+5. Every query must be a search-engine query, not the user's task sentence. Do not copy task wording such as write, report, summarize, research, 搜集, 写, 报告, 研判, 总结, 调研.
+6. Do not select videos and do not write transcript-fetch-plan.json; the Python runner will execute your queries, merge candidates, fetch transcripts in parallel, and build compact web evidence.
 
 Return JSON exactly in this shape:
 {{
   "schema_version": 1,
-  "supplemental_queries": [
+  "supplemental_youtube_queries": [
     {{"query": "<youtube search query>", "reason": "<brief reason>"}}
+  ],
+  "supplemental_web_queries": [
+    {{"query": "<google web search query>", "reason": "<brief reason>"}}
   ]
 }}
 """
@@ -226,7 +237,7 @@ Required workflow:
    {fetch_command}
 2. Open and read the generated `.transcript.json` file before drafting.
 3. Use the complete transcript context as source evidence, including metadata, chapters, coverage, segments, and timestamp URLs.
-4. Write a coherent Markdown article that answers the research request and includes clickable YouTube timestamp links. Put each timestamp citation in parentheses with a very short source or claim cue followed by a timestamp-only link, exactly like `(罗福莉谈框架自进化 [00:55:33](https://www.youtube.com/watch?v=...&t=3333s))`. Do not use labels such as `▶ 12:34`, source names, or sentence fragments as the visible text inside timestamp links.
+4. Write a coherent Markdown article that answers the research request and includes clickable YouTube timestamp links. The visible text of each timestamp link must be a concise but informative, consistent video-title cue plus the timestamp, exactly like `[马斯克 Lex Fridman 访谈 00:55:33](https://www.youtube.com/watch?v=...&t=3333s)`. Use the same cue for every link from the same video. Do not use bare timestamp links such as `[00:55:33](...)`, parenthetical cue wrappers such as `(马斯克访谈 [00:55:33](...))`, or labels such as `▶ 12:34`.
 5. Do not create article drafts in any other directory. Do not expose hidden reasoning.
 
 Required outputs:
@@ -288,7 +299,7 @@ Required JSON schema:
       "start_sec": 0,
       "url": "https://www.youtube.com/watch?v=<id>&t=<seconds>s",
       "quote_or_paraphrase": "<short source-faithful quote or paraphrase>",
-      "source_cue": "<very short Chinese cue suitable before a timestamp link>"
+      "source_cue": "<concise but informative video-title cue suitable inside a timestamp link before the time>"
     }}
   ]
 }}
@@ -309,7 +320,13 @@ def build_wide_article_prompt(
     evidence_manifest_path: Path,
     article_path: Path,
     sources_manifest_path: Path,
+    web_evidence_path: Path | None = None,
 ) -> str:
+    web_evidence_block = (
+        f"\nAlso read this web evidence file for background and corroboration:\n{web_evidence_path}\n"
+        if web_evidence_path is not None
+        else ""
+    )
     return f"""Write the final grounded wide video deep research article from compact evidence cards.
 
 Research request:
@@ -320,6 +337,7 @@ Read this evidence manifest first:
 
 Also read this source manifest for video titles, channels, and source cues:
 {sources_manifest_path}
+{web_evidence_block}
 
 Write the final Markdown article only to this exact path:
 {article_path}
@@ -330,9 +348,10 @@ Required workflow:
 3. Synthesize across sources. Compare recurring claims, changes over time, disagreements, and caveats when the evidence supports them.
 4. Do not let one long transcript dominate a broad-topic article when other usable evidence cards are available.
 5. Write a coherent Markdown article that answers the research request and includes clickable YouTube timestamp links.
-6. Put each timestamp citation in parentheses with a very short source or claim cue followed by a timestamp-only link, exactly like `(罗福莉谈框架自进化 [00:55:33](https://www.youtube.com/watch?v=...&t=3333s))`. Do not use labels such as `▶ 12:34`, source names, or sentence fragments as the visible text inside timestamp links.
-7. If evidence generation failed for some transcripts or useful sources were excluded, state the coverage limitation briefly in the article.
-8. Do not create article drafts in any other directory. Do not expose hidden reasoning.
+6. The visible text of each timestamp citation must be a concise but informative, consistent video-title cue plus the timestamp, exactly like `[马斯克 Lex Fridman 访谈 00:55:33](https://www.youtube.com/watch?v=...&t=3333s)`. Use the same cue for every link from the same video. Do not use bare timestamp links such as `[00:55:33](...)`, parenthetical cue wrappers such as `(马斯克访谈 [00:55:33](...))`, or labels such as `▶ 12:34`.
+7. Use web evidence only for background, fact-checking, timelines, official/company/person context, and corroboration. Cite web sources with normal Markdown links when used, and do not turn snippet-level evidence into unsupported strong claims.
+8. If evidence generation failed for some transcripts or useful sources were excluded, state the coverage limitation briefly in the article.
+9. Do not create article drafts in any other directory. Do not expose hidden reasoning.
 
 At the end, print:
 evidence: {evidence_manifest_path}
@@ -359,7 +378,7 @@ def _candidate_summary_for_query_planner(selection_manifest_path: Path, *, limit
 
 
 def build_query_planner_prompt(*, question: str, selection_manifest_path: Path) -> str:
-    return f"""Plan only supplemental YouTube search queries for a video deep research task.
+    return f"""Plan only supplemental YouTube and Web search queries for a video deep research task.
 
 Research request:
 {question}
@@ -370,8 +389,11 @@ Current candidate snapshot:
 Return only compact JSON:
 {{
   "schema_version": 1,
-  "supplemental_queries": [
+  "supplemental_youtube_queries": [
     {{"query": "<youtube search query>", "reason": "<brief reason>"}}
+  ],
+  "supplemental_web_queries": [
+    {{"query": "<google web search query>", "reason": "<brief reason>"}}
   ]
 }}
 
@@ -379,8 +401,50 @@ Rules:
 - Do not use tools.
 - Do not select videos.
 - Do not write files.
-- Return at most {WIDE_SUPPLEMENTAL_QUERY_COUNT} queries.
-- Prefer queries that improve source diversity, recency, speaker diversity, and English/Chinese balance.
+- Return at most {WIDE_SUPPLEMENTAL_QUERY_COUNT} YouTube queries and at most {WIDE_SUPPLEMENTAL_WEB_QUERY_COUNT} Web queries.
+- Each query must be a search-engine query, not a user task or sentence.
+- Do not include words whose only purpose is instructing the agent, such as write, report, summarize, research, 搜集, 写, 报告, 研判, 总结, 调研.
+- YouTube queries should look like terms a person would type into YouTube: topic + speaker/entity if useful + interview/podcast/talk/keynote + year.
+- Web queries should look like Google queries: topic + entity + interview/podcast/keynote + date or recency terms when useful.
+- YouTube queries should improve transcript source diversity, recency, speaker diversity, and English/Chinese balance.
+- Web queries should find background facts, timelines, official announcements, company/person context, and corroborating sources.
+"""
+
+
+def build_initial_search_query_prompt(*, input_value: str, question: str, max_queries: int = INITIAL_DISCOVERY_QUERY_COUNT) -> str:
+    return f"""Generate initial YouTube search queries for a wide video deep research task.
+
+Research request:
+{question}
+
+Raw user input:
+{input_value}
+
+Return only compact JSON:
+{{
+  "schema_version": 1,
+  "youtube_search_queries": [
+    {{"query": "<youtube search query>", "reason": "<brief reason>", "language": "<zh|en|mixed>"}}
+  ]
+}}
+
+Rules:
+- Generate up to {max_queries} queries.
+- Each query must be a search-engine query, not a user task or sentence.
+- Do not copy the raw user request if it contains instructions like write a report, summarize, research, 搜集, 写一份, 报告, 研判, 总结, 调研.
+- Prefer concise YouTube-style queries: topic + source type + speaker/entity if useful + year.
+- Include source-type words users actually search for, such as interview, podcast, talk, keynote, panel, 访谈, 播客, 对谈, 演讲.
+- Mix Chinese and English queries when the topic spans both markets.
+- If the request has a recent time window, express it as search-friendly year/month or recency terms, not as a full natural-language instruction.
+
+Bad query:
+搜集近三个月以来 ai 行业的重要访谈，播客，写一份该行业的研判报告 interview talk
+
+Good queries:
+AI industry interview podcast 2026
+AI leaders interview podcast 2026
+人工智能 行业 访谈 播客 2026
+AI keynote panel 2026
 """
 
 
@@ -451,6 +515,7 @@ def write_run_manifest(
         "model": model,
         "workspace_dir": str(paths["workspace_dir"]),
         "search_dir": str(paths["search_dir"]),
+        "web_search_dir": str(paths["web_search_dir"]),
         "transcript_dir": str(paths["transcript_dir"]),
         "evidence_dir": str(paths["evidence_dir"]),
         "articles_root": str(paths["articles_root"]),
@@ -458,7 +523,10 @@ def write_run_manifest(
         "artifacts": {
             "run_manifest": str(path),
             "search_manifest": str(paths["search_dir"] / "search-manifest.json"),
+            "web_search_manifest": str(paths["web_search_dir"] / "web-search-manifest.json"),
+            "web_evidence": str(paths["web_search_dir"] / WEB_EVIDENCE_FILENAME),
             "sources_manifest": str(resolved_sources_manifest_path),
+            "initial_query_plan": str(paths["workspace_dir"] / INITIAL_SEARCH_QUERY_PLAN_FILENAME),
             "query_plan": str(paths["workspace_dir"] / QUERY_PLAN_FILENAME),
             "transcript_fetch_plan": str(paths["workspace_dir"] / TRANSCRIPT_FETCH_PLAN_FILENAME),
             "transcript_fetch_manifest": str(paths["workspace_dir"] / TRANSCRIPT_FETCH_MANIFEST_FILENAME),
@@ -483,6 +551,7 @@ def write_run_manifest(
     if sources_manifest is not None:
         payload["artifact_summary"] = {
             "search_count": sources_manifest.get("search_count"),
+            "web_search_count": sources_manifest.get("web_search_count"),
             "transcript_count": sources_manifest.get("transcript_count"),
             "article_referenced_video_count": sources_manifest.get("article_referenced_video_count"),
         }
@@ -511,11 +580,13 @@ def write_sources_manifest(
     path: Path,
     *,
     search_dir: Path,
+    web_search_dir: Path | None = None,
     transcript_dir: Path,
     article_path: Path,
     run_id: str | None = None,
 ) -> dict[str, object]:
     search_files = sorted(search_dir.glob("*.search.json")) if search_dir.exists() else []
+    web_search_files = sorted(web_search_dir.glob("*.web-search.json")) if web_search_dir is not None and web_search_dir.exists() else []
     transcript_files = sorted(transcript_dir.glob("*.transcript.json")) if transcript_dir.exists() else []
 
     sources: dict[str, dict[str, object]] = {}
@@ -574,6 +645,28 @@ def write_sources_manifest(
                         "score": raw_candidate.get("score"),
                     }
                 )
+
+    web_search_summaries: list[dict[str, object]] = []
+    for web_search_path in web_search_files:
+        payload = _read_json_object(web_search_path)
+        if payload is None:
+            continue
+        if run_id is not None and payload.get("run_id") != run_id:
+            continue
+        results = payload.get("results")
+        if not isinstance(results, list):
+            results = []
+        web_search_summaries.append(
+            {
+                "path": str(web_search_path),
+                "raw_output_path": payload.get("raw_output_path"),
+                "query": payload.get("query"),
+                "canonical_query": payload.get("canonical_query"),
+                "query_hash": payload.get("query_hash"),
+                "result_count": len(results),
+                "top_urls": [str(item.get("url")) for item in results[:5] if isinstance(item, dict) and item.get("url")],
+            }
+        )
 
     transcript_summaries: list[dict[str, object]] = []
     for transcript_path in transcript_files:
@@ -650,12 +743,15 @@ def write_sources_manifest(
         "generated_at": _utc_now(),
         "run_id": run_id,
         "search_dir": str(search_dir),
+        "web_search_dir": str(web_search_dir) if web_search_dir is not None else None,
         "transcript_dir": str(transcript_dir),
         "article_path": str(article_path),
         "search_count": len(search_summaries),
+        "web_search_count": len(web_search_summaries),
         "transcript_count": len(transcript_summaries),
         "article_referenced_video_count": len(article_video_ids),
         "searches": search_summaries,
+        "web_searches": web_search_summaries,
         "transcripts": transcript_summaries,
         "sources": sorted(sources.values(), key=lambda item: str(item.get("video_id"))),
     }
@@ -670,10 +766,10 @@ def _timestamp_link_count(text: str) -> int:
 TIMESTAMP_MARKDOWN_LINK_RE = re.compile(
     r"(?<!!)\[([^\]\n]+)\]\((https://(?:www\.)?(?:youtube\.com/watch\?[^)\s]+|youtu\.be/[^)\s]+)[^)\s]*)\)"
 )
-TIMESTAMP_CITATION_RE = re.compile(
-    r"(?P<intro>[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff_\-]{0,18})\s+"
-    r"\[(?P<label>\d{2}:\d{2}:\d{2})\]"
-    r"\((?P<url>https://(?:www\.)?(?:youtube\.com/watch\?[^)\s]+|youtu\.be/[^)\s]+)[^)\s]*)\)"
+OLD_TIMESTAMP_CITATION_RE = re.compile(
+    r"[\(（][A-Za-z0-9\u4e00-\u9fff][^()（）\[\]\n]{0,40}\s+"
+    r"(?P<link>\[[^\]\n]*\d{2}:\d{2}:\d{2}\]"
+    r"\(https://(?:www\.)?(?:youtube\.com/watch\?[^)\s]+|youtu\.be/[^)\s]+)[^)\s]*\))[\)）]"
 )
 
 
@@ -753,6 +849,20 @@ def _timestamp_link_intro(label: str, expected_label: str) -> str:
     return cleaned
 
 
+def _timestamp_link_cue(label: str, expected_label: str) -> str:
+    cleaned = label.strip().strip("`").strip()
+    if cleaned.endswith(expected_label):
+        cleaned = cleaned[: -len(expected_label)].strip()
+    else:
+        cleaned = _timestamp_link_intro(cleaned, expected_label)
+    cleaned = re.sub(r"^[\[(（]+|[\])）]+$", "", cleaned).strip()
+    cleaned = re.sub(r"[\s:：,，.。;；|｜\-–—▶▷►]+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if cleaned.lower() in GENERIC_TIMESTAMP_LINK_LABELS:
+        return ""
+    return cleaned
+
+
 def _source_cue_from_title(title: str | None, channel: str | None = None) -> str:
     value = re.sub(r"\s+", " ", (title or "").strip())
     match = re.search(r"对([^的：:，,|丨\-\s]{1,8})的.{0,4}访谈", value)
@@ -761,12 +871,14 @@ def _source_cue_from_title(title: str | None, channel: str | None = None) -> str
     value = re.sub(r"^\s*\d+\s*[.、:：-]\s*", "", value)
     value = re.split(r"[|丨:：\-—]", value, maxsplit=1)[0].strip()
     if re.search(r"[\u4e00-\u9fff]", value):
-        return value[:10] if value else "视频片段"
+        cue = value[:32].strip()
+        cue = re.sub(r"[，,。.;；:：|｜\-–—▶▷►\s]+$", "", cue).strip()
+        return cue if cue else "视频片段"
     words = re.findall(r"[A-Za-z0-9]+", value)
     if words:
-        return " ".join(words[:3])
+        return " ".join(words[:6])
     channel_value = re.sub(r"\s+", " ", (channel or "").strip())
-    return channel_value[:16] if channel_value else "视频片段"
+    return channel_value[:32].strip() if channel_value else "视频片段"
 
 
 def _source_cues_from_manifest(sources_manifest: dict[str, object] | None) -> dict[str, str]:
@@ -786,53 +898,38 @@ def _source_cues_from_manifest(sources_manifest: dict[str, object] | None) -> di
     return cues
 
 
-def _line_prefix_has_timestamp_intro(text: str, link_start: int) -> bool:
+def _line_prefix_timestamp_intro(text: str, link_start: int) -> str:
     line_start = text.rfind("\n", 0, link_start) + 1
     prefix = text[line_start:link_start].strip()
     prefix = re.sub(r"^[>\-\*\d.)\s]+", "", prefix).strip()
     prefix = re.sub(r"[，,。.;；:：|｜\-–—▶▷►\s]+$", "", prefix).strip()
     prefix = re.split(r"[。！？!?；;]|\)\s*", prefix)[-1].strip()
+    prefix = re.split(r"[\(（]", prefix)[-1].strip()
     if len(prefix) > 18:
         prefix = re.split(r"\s+", prefix)[-1].strip()
-    prefix = prefix.strip("*_` ")
+    prefix = prefix.strip("*_` ()（）[]【】")
     if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", prefix):
-        return False
+        return ""
     if len(prefix) > 18:
-        return False
-    return not bool(re.search(r"[，,。！？!?；;:：]", prefix))
+        return ""
+    if re.search(r"[，,。！？!?；;:：]", prefix):
+        return ""
+    return prefix
 
 
-def _is_timestamp_citation_wrapped(text: str, link_start: int, link_end: int) -> bool:
-    line_start = text.rfind("\n", 0, link_start) + 1
-    prefix = text[line_start:link_start]
-    open_paren = prefix.rfind("(")
-    if open_paren == -1:
-        return False
-    intro = prefix[open_paren + 1 :].strip()
-    if not intro or len(intro) > 18:
-        return False
-    if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", intro):
-        return False
-    if re.search(r"[，,。！？!?；;:：()\[\]]", intro):
-        return False
-    suffix = text[link_end:]
-    return suffix.startswith(")")
+def _timestamp_link_label_is_valid(label: str, expected_label: str) -> bool:
+    return bool(_timestamp_link_cue(label, expected_label)) and label.strip().strip("`").strip().endswith(expected_label)
 
 
-def _wrap_timestamp_citations(text: str) -> tuple[str, int]:
+def _collapse_old_timestamp_citations(text: str) -> tuple[str, int]:
+    normalized = text
     replacement_count = 0
-
-    def replace_citation(match: re.Match[str]) -> str:
-        nonlocal replacement_count
-        seconds = _timestamp_seconds_from_youtube_url(match.group("url"))
-        if seconds is None or match.group("label") != _format_timestamp_text(seconds):
-            return match.group(0)
-        if _is_timestamp_citation_wrapped(text, match.start("label") - 1, match.end()):
-            return match.group(0)
-        replacement_count += 1
-        return f"({match.group(0)})"
-
-    return TIMESTAMP_CITATION_RE.sub(replace_citation, text), replacement_count
+    for _ in range(3):
+        normalized, count = OLD_TIMESTAMP_CITATION_RE.subn(lambda match: match.group("link"), normalized)
+        replacement_count += count
+        if count == 0:
+            break
+    return normalized, replacement_count
 
 
 def normalize_youtube_timestamp_link_text(
@@ -854,30 +951,23 @@ def normalize_youtube_timestamp_link_text(
         if seconds is None:
             return match.group(0)
         expected_label = _format_timestamp_text(seconds)
-        if label == expected_label:
-            intro = ""
-            if not _is_timestamp_citation_wrapped(text, match.start(), match.end()):
-                previous_char = text[match.start() - 1] if match.start() > 0 else ""
-                if previous_char and not previous_char.isspace():
-                    video_id = _video_id_from_youtube_url(url)
-                    if video_id:
-                        intro = source_cues.get(video_id, "")
-        else:
-            intro = _timestamp_link_intro(label, expected_label)
-        if not intro and not _line_prefix_has_timestamp_intro(text, match.start()):
-            video_id = _video_id_from_youtube_url(url)
-            if video_id:
-                intro = source_cues.get(video_id, "")
-        if label == expected_label and not intro:
+        video_id = _video_id_from_youtube_url(url)
+        cue = source_cues.get(video_id or "", "") if video_id else ""
+        if not cue:
+            cue = _timestamp_link_cue(label, expected_label)
+        if not cue:
+            cue = _line_prefix_timestamp_intro(text, match.start())
+        if not cue:
+            return match.group(0)
+        new_label = f"{cue} {expected_label}"
+        if label == new_label:
             return match.group(0)
         replacement_count += 1
-        if intro:
-            return f"({intro} [{expected_label}]({url}))"
-        return f"[{expected_label}]({url})"
+        return f"[{new_label}]({url})"
 
     normalized = TIMESTAMP_MARKDOWN_LINK_RE.sub(replace_link, text)
-    normalized, wrapped_count = _wrap_timestamp_citations(normalized)
-    replacement_count += wrapped_count
+    normalized, collapsed_count = _collapse_old_timestamp_citations(normalized)
+    replacement_count += collapsed_count
     if normalized != text:
         article_path.write_text(normalized, encoding="utf-8")
     return replacement_count
@@ -889,7 +979,7 @@ def _timestamp_link_text_issue_count(text: str) -> int:
         seconds = _timestamp_seconds_from_youtube_url(match.group(2))
         if seconds is None:
             continue
-        if match.group(1) != _format_timestamp_text(seconds):
+        if not _timestamp_link_label_is_valid(match.group(1), _format_timestamp_text(seconds)):
             issue_count += 1
     return issue_count
 
@@ -897,12 +987,10 @@ def _timestamp_link_text_issue_count(text: str) -> int:
 def _timestamp_link_intro_issue_count(text: str) -> int:
     issue_count = 0
     for match in TIMESTAMP_MARKDOWN_LINK_RE.finditer(text):
-        if _timestamp_seconds_from_youtube_url(match.group(2)) is None:
+        seconds = _timestamp_seconds_from_youtube_url(match.group(2))
+        if seconds is None:
             continue
-        if not _line_prefix_has_timestamp_intro(text, match.start()):
-            issue_count += 1
-            continue
-        if not _is_timestamp_citation_wrapped(text, match.start(), match.end()):
+        if not _timestamp_link_cue(match.group(1), _format_timestamp_text(seconds)):
             issue_count += 1
     return issue_count
 
@@ -970,6 +1058,7 @@ def write_quality_report(
         issues.append({"severity": severity, "code": code, "message": message})
 
     search_count = int(sources_manifest.get("search_count") or 0)
+    web_search_count = int(sources_manifest.get("web_search_count") or 0)
     transcript_count = int(sources_manifest.get("transcript_count") or 0)
     timestamp_link_count = int((article_manifest or {}).get("timestamp_link_count") or 0)
     timestamp_link_text_issue_count = int((article_manifest or {}).get("timestamp_link_text_issue_count") or 0)
@@ -991,13 +1080,13 @@ def write_quality_report(
         add_issue(
             "warning",
             "timestamp_link_text_inconsistent",
-            "Some YouTube timestamp links do not use HH:MM:SS as their visible text.",
+            "Some YouTube timestamp links do not use '<short video title> HH:MM:SS' as their visible text.",
         )
     if timestamp_link_intro_issue_count:
         add_issue(
             "warning",
             "timestamp_link_intro_missing",
-            "Some YouTube timestamp links do not have a short source or claim cue immediately before them.",
+            "Some YouTube timestamp links do not include a short video-title cue before the timestamp inside the link text.",
         )
     if research_mode == "wide":
         if search_count < 2:
@@ -1043,6 +1132,7 @@ def write_quality_report(
         "research_mode": research_mode,
         "article_path": str(article_path),
         "search_count": search_count,
+        "web_search_count": web_search_count,
         "transcript_count": transcript_count,
         "evidence_transcript_count": evidence_transcript_count,
         "evidence_success_count": evidence_success_count,
@@ -1075,6 +1165,7 @@ def write_artifact_reports(
     article_path: Path,
     run_id: str,
     research_mode: str,
+    web_search_dir: Path | None = None,
     research_plan_path: Path | None = None,
     video_enrichment_manifest_path: Path | None = None,
     selection_manifest_path: Path | None = None,
@@ -1083,6 +1174,7 @@ def write_artifact_reports(
     sources_manifest = write_sources_manifest(
         sources_manifest_path,
         search_dir=search_dir,
+        web_search_dir=web_search_dir,
         transcript_dir=transcript_dir,
         article_path=article_path,
         run_id=run_id,
@@ -1317,6 +1409,65 @@ def _video_url_from_id(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def write_web_evidence_cards(
+    *,
+    web_search_dir: Path,
+    web_evidence_path: Path,
+    run_id: str,
+    limit: int = WEB_EVIDENCE_MAX_CARDS,
+) -> dict[str, object]:
+    cards: list[dict[str, object]] = []
+    seen_urls: set[str] = set()
+    web_search_files = sorted(web_search_dir.glob("*.web-search.json")) if web_search_dir.exists() else []
+    for search_path in web_search_files:
+        payload = _read_json_object(search_path)
+        if payload is None or payload.get("run_id") != run_id:
+            continue
+        results = payload.get("results")
+        if not isinstance(results, list):
+            continue
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            url = str(result.get("url") or "").strip()
+            title = str(result.get("title") or "").strip()
+            snippet = str(result.get("snippet") or "").strip()
+            if not url or not title or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            cards.append(
+                {
+                    "source_kind": "web",
+                    "query": result.get("query") or payload.get("query"),
+                    "title": title,
+                    "url": url,
+                    "source": result.get("source"),
+                    "date": result.get("date"),
+                    "rank": result.get("rank"),
+                    "result_type": result.get("result_type"),
+                    "claim_summary": snippet or title,
+                    "snippet": snippet,
+                    "search_path": str(search_path),
+                    "usage_note": "Snippet-level web evidence; use for background or corroboration, not unsupported strong claims.",
+                }
+            )
+            if len(cards) >= limit:
+                break
+        if len(cards) >= limit:
+            break
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "generated_at": _utc_now(),
+        "run_id": run_id,
+        "source_kind": "web",
+        "web_search_dir": str(web_search_dir),
+        "card_count": len(cards),
+        "cards": cards,
+    }
+    _write_json(web_evidence_path, manifest)
+    return manifest
+
+
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -1404,18 +1555,24 @@ def _extract_json_object_from_text(text: str) -> dict[str, object] | None:
         return payload if isinstance(payload, dict) else None
     except json.JSONDecodeError:
         pass
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        return None
-    try:
-        payload = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            payload, _ = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
-def _supplemental_queries_from_payload(payload: dict[str, object] | None) -> list[dict[str, str]]:
-    raw_queries = (payload or {}).get("supplemental_queries")
+def _supplemental_queries_from_payload(
+    payload: dict[str, object] | None,
+    *,
+    key: str = "supplemental_queries",
+    limit: int = WIDE_SUPPLEMENTAL_QUERY_COUNT,
+) -> list[dict[str, str]]:
+    raw_queries = (payload or {}).get(key)
     if not isinstance(raw_queries, list):
         return []
     queries: list[dict[str, str]] = []
@@ -1430,22 +1587,144 @@ def _supplemental_queries_from_payload(payload: dict[str, object] | None) -> lis
         else:
             continue
         normalized = re.sub(r"\s+", " ", query_text).strip()
-        key = normalized.casefold()
-        if not normalized or key in seen:
+        seen_key = normalized.casefold()
+        if not normalized or seen_key in seen:
             continue
-        seen.add(key)
+        seen.add(seen_key)
         queries.append({"query": normalized, "reason": reason})
-        if len(queries) >= WIDE_SUPPLEMENTAL_QUERY_COUNT:
+        if len(queries) >= limit:
             break
     return queries
 
 
-def write_query_plan(path: Path, *, run_id: str, queries: list[dict[str, str]], raw_text: str) -> dict[str, object]:
+def _youtube_queries_from_payload(payload: dict[str, object] | None) -> list[dict[str, str]]:
+    queries = _supplemental_queries_from_payload(
+        payload,
+        key="supplemental_youtube_queries",
+        limit=WIDE_SUPPLEMENTAL_QUERY_COUNT,
+    )
+    if queries:
+        return queries
+    return _supplemental_queries_from_payload(
+        payload,
+        key="supplemental_queries",
+        limit=WIDE_SUPPLEMENTAL_QUERY_COUNT,
+    )
+
+
+def _web_queries_from_payload(payload: dict[str, object] | None) -> list[dict[str, str]]:
+    return _supplemental_queries_from_payload(
+        payload,
+        key="supplemental_web_queries",
+        limit=WIDE_SUPPLEMENTAL_WEB_QUERY_COUNT,
+    )
+
+
+def _initial_youtube_queries_from_payload(payload: dict[str, object] | None) -> list[dict[str, object]]:
+    raw_queries = (payload or {}).get("youtube_search_queries")
+    if not isinstance(raw_queries, list):
+        raw_queries = (payload or {}).get("queries")
+    if not isinstance(raw_queries, list):
+        return []
+    queries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in raw_queries:
+        if isinstance(item, str):
+            query_text = item
+            reason = "LLM-generated initial YouTube discovery query"
+            language = "mixed"
+        elif isinstance(item, dict):
+            query_text = str(item.get("query") or "").strip()
+            reason = str(item.get("reason") or "").strip() or "LLM-generated initial YouTube discovery query"
+            language = str(item.get("language") or "mixed").strip() or "mixed"
+        else:
+            continue
+        normalized = re.sub(r"\s+", " ", query_text).strip()
+        seen_key = normalized.casefold()
+        if not normalized or seen_key in seen:
+            continue
+        seen.add(seen_key)
+        queries.append(
+            {
+                "round": 1,
+                "query": normalized,
+                "intent": reason,
+                "expected_source_type": "interview/podcast/talk/panel/keynote",
+                "language": language,
+            }
+        )
+        if len(queries) >= INITIAL_DISCOVERY_QUERY_COUNT:
+            break
+    return queries
+
+
+def write_initial_search_query_plan(
+    path: Path,
+    *,
+    run_id: str,
+    queries: list[dict[str, object]],
+    raw_text: str,
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": 1,
         "generated_at": _utc_now(),
         "run_id": run_id,
-        "supplemental_queries": queries,
+        "queries": queries,
+        "raw_text": raw_text,
+    }
+    _write_json(path, payload)
+    return payload
+
+
+async def plan_initial_search_queries(
+    *,
+    input_value: str,
+    question: str,
+    initial_query_plan_path: Path,
+    run_id: str,
+    options: ClaudeAgentOptions,
+    logger: object,
+) -> list[dict[str, object]]:
+    prompt = build_initial_search_query_prompt(input_value=input_value, question=question)
+    logger.info(format_log_event("initial_query_planner_prompt_ready", {"prompt_chars": len(prompt)}))
+    text, _ = await _consume_sdk_query_text(prompt, options, logger, "initial_query_planner_sdk_message")
+    payload = _extract_json_object_from_text(text)
+    queries = _initial_youtube_queries_from_payload(payload)
+    write_initial_search_query_plan(
+        initial_query_plan_path,
+        run_id=run_id,
+        queries=queries,
+        raw_text=text,
+    )
+    logger.info(
+        format_log_event(
+            "initial_query_plan_ready",
+            {
+                "query_count": len(queries),
+                "initial_query_plan_path": str(initial_query_plan_path),
+            },
+        )
+    )
+    if not queries:
+        raise AgentRunError("initial search query planner returned no YouTube queries")
+    return queries
+
+
+def write_query_plan(
+    path: Path,
+    *,
+    run_id: str,
+    youtube_queries: list[dict[str, str]],
+    web_queries: list[dict[str, str]],
+    raw_text: str,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "generated_at": _utc_now(),
+        "run_id": run_id,
+        "supplemental_queries": youtube_queries,
+        "supplemental_youtube_queries": youtube_queries,
+        "supplemental_web_queries": web_queries,
         "raw_text": raw_text,
     }
     _write_json(path, payload)
@@ -1464,9 +1743,26 @@ async def plan_supplemental_queries(
     prompt = build_query_planner_prompt(question=question, selection_manifest_path=selection_manifest_path)
     logger.info(format_log_event("query_planner_prompt_ready", {"prompt_chars": len(prompt)}))
     text, _ = await _consume_sdk_query_text(prompt, options, logger, "query_planner_sdk_message")
-    queries = _supplemental_queries_from_payload(_extract_json_object_from_text(text))
-    plan = write_query_plan(query_plan_path, run_id=run_id, queries=queries, raw_text=text)
-    logger.info(format_log_event("query_plan_ready", {"query_count": len(queries), "query_plan_path": str(query_plan_path)}))
+    payload = _extract_json_object_from_text(text)
+    youtube_queries = _youtube_queries_from_payload(payload)
+    web_queries = _web_queries_from_payload(payload)
+    plan = write_query_plan(
+        query_plan_path,
+        run_id=run_id,
+        youtube_queries=youtube_queries,
+        web_queries=web_queries,
+        raw_text=text,
+    )
+    logger.info(
+        format_log_event(
+            "query_plan_ready",
+            {
+                "youtube_query_count": len(youtube_queries),
+                "web_query_count": len(web_queries),
+                "query_plan_path": str(query_plan_path),
+            },
+        )
+    )
     return plan
 
 
@@ -1479,7 +1775,7 @@ async def run_supplemental_searches(
     logger: object,
     max_concurrency: int = WIDE_SUPPLEMENTAL_SEARCH_MAX_CONCURRENCY,
 ) -> list[str]:
-    queries = _supplemental_queries_from_payload(query_plan)
+    queries = _youtube_queries_from_payload(query_plan)
     if not queries:
         return []
     _emit_progress(
@@ -1509,6 +1805,47 @@ async def run_supplemental_searches(
 
     paths = await loop.run_in_executor(None, run_pool)
     logger.info(format_log_event("supplemental_searches_completed", {"search_count": len(paths), "paths": paths}))
+    return paths
+
+
+async def run_supplemental_web_searches(
+    *,
+    query_plan: dict[str, object],
+    web_search_dir: Path,
+    run_id: str,
+    progress_sink: ProgressSink | None,
+    logger: object,
+    max_concurrency: int = WIDE_SUPPLEMENTAL_SEARCH_MAX_CONCURRENCY,
+) -> list[str]:
+    queries = _web_queries_from_payload(query_plan)
+    if not queries:
+        return []
+    _emit_progress(
+        progress_sink,
+        "phase_progress",
+        "source_fetch",
+        "正在并发执行补充 Web 搜索",
+        data={"query_count": len(queries), "max_concurrency": max_concurrency},
+    )
+    loop = asyncio.get_running_loop()
+
+    def run_pool() -> list[str]:
+        results: list[str] = []
+        with ThreadPoolExecutor(max_workers=max(1, max_concurrency)) as executor:
+            future_map = {
+                executor.submit(search_web_context, item["query"], output_dir=web_search_dir, run_id=run_id): item
+                for item in queries
+            }
+            for future in wait(future_map.keys()).done:
+                item = future_map[future]
+                try:
+                    results.append(str(future.result()))
+                except Exception as exc:
+                    logger.warning(format_log_event("supplemental_web_search_failed", {"query": item["query"], "error_message": str(exc)}))
+        return sorted(results)
+
+    paths = await loop.run_in_executor(None, run_pool)
+    logger.info(format_log_event("supplemental_web_searches_completed", {"search_count": len(paths), "paths": paths}))
     return paths
 
 
@@ -1969,6 +2306,7 @@ async def run_agent(
     source_id = build_source_id(input_value)
     paths = build_workspace_paths(output_root, source_id)
     paths["search_dir"].mkdir(parents=True, exist_ok=True)
+    paths["web_search_dir"].mkdir(parents=True, exist_ok=True)
     paths["transcript_dir"].mkdir(parents=True, exist_ok=True)
     paths["evidence_dir"].mkdir(parents=True, exist_ok=True)
     paths["articles_root"].mkdir(parents=True, exist_ok=True)
@@ -1981,12 +2319,17 @@ async def run_agent(
     article_manifest_path = article_dir / ARTICLE_MANIFEST_FILENAME
     quality_report_path = paths["workspace_dir"] / QUALITY_REPORT_FILENAME
     evidence_manifest_path = paths["evidence_dir"] / EVIDENCE_MANIFEST_FILENAME
+    web_evidence_path = paths["web_search_dir"] / WEB_EVIDENCE_FILENAME
+    initial_query_plan_path = paths["workspace_dir"] / INITIAL_SEARCH_QUERY_PLAN_FILENAME
     query_plan_path = paths["workspace_dir"] / QUERY_PLAN_FILENAME
     transcript_fetch_plan_path = paths["workspace_dir"] / TRANSCRIPT_FETCH_PLAN_FILENAME
     transcript_fetch_manifest_path = paths["workspace_dir"] / TRANSCRIPT_FETCH_MANIFEST_FILENAME
     research_plan_path = paths["workspace_dir"] / RESEARCH_PLAN_FILENAME
     video_enrichment_manifest_path = paths["workspace_dir"] / VIDEO_ENRICHMENT_MANIFEST_FILENAME
     selection_manifest_path = paths["workspace_dir"] / SELECTION_MANIFEST_FILENAME
+    options = build_agent_options(project_root, model=model)
+    evidence_model = resolve_evidence_model(env_values, model)
+    evidence_options = build_agent_options(project_root, model=evidence_model)
     write_run_manifest(
         run_manifest_path,
         status="running",
@@ -2017,14 +2360,34 @@ async def run_agent(
 
     discovery_artifacts: dict[str, Path] = {}
     if should_prepare_discovery(input_value, resolved_mode):
-        _emit_progress(
-            progress_sink,
-            "phase_progress",
-            "source_fetch",
-            "正在并行搜索并富化 YouTube 候选源",
-            data={"search_dir": str(paths["search_dir"])},
-        )
         try:
+            planned_discovery_queries: list[dict[str, object]] | None = None
+            if resolved_mode == "wide":
+                _emit_progress(
+                    progress_sink,
+                    "phase_progress",
+                    "source_fetch",
+                    "正在用 LLM 生成搜索引擎友好的初始 YouTube query",
+                    data={"initial_query_plan_path": str(initial_query_plan_path)},
+                )
+                planned_discovery_queries = await plan_initial_search_queries(
+                    input_value=input_value,
+                    question=question,
+                    initial_query_plan_path=initial_query_plan_path,
+                    run_id=run_id,
+                    options=options,
+                    logger=logger,
+                )
+            _emit_progress(
+                progress_sink,
+                "phase_progress",
+                "source_fetch",
+                "正在并行搜索并富化 YouTube 候选源",
+                data={
+                    "search_dir": str(paths["search_dir"]),
+                    "query_count": len(planned_discovery_queries) if planned_discovery_queries is not None else None,
+                },
+            )
             discovery_artifacts = prepare_research_discovery(
                 input_value=input_value,
                 question=question,
@@ -2032,6 +2395,7 @@ async def run_agent(
                 workspace_dir=paths["workspace_dir"],
                 search_dir=paths["search_dir"],
                 run_id=run_id,
+                planned_queries=planned_discovery_queries,
             )
         except Exception as exc:
             write_artifact_reports(
@@ -2039,6 +2403,7 @@ async def run_agent(
                 article_manifest_path=article_manifest_path,
                 quality_report_path=quality_report_path,
                 search_dir=paths["search_dir"],
+                web_search_dir=paths["web_search_dir"],
                 transcript_dir=paths["transcript_dir"],
                 article_path=article_path,
                 run_id=run_id,
@@ -2068,9 +2433,6 @@ async def run_agent(
             )
             raise
 
-    options = build_agent_options(project_root, model=model)
-    evidence_model = resolve_evidence_model(env_values, model)
-    evidence_options = build_agent_options(project_root, model=evidence_model)
     prompt = (
         build_query_planner_prompt(question=question, selection_manifest_path=selection_manifest_path)
         if resolved_mode == "wide"
@@ -2125,12 +2487,26 @@ async def run_agent(
                 options=options,
                 logger=logger,
             )
-            await run_supplemental_searches(
-                query_plan=query_plan,
-                search_dir=paths["search_dir"],
+            await asyncio.gather(
+                run_supplemental_searches(
+                    query_plan=query_plan,
+                    search_dir=paths["search_dir"],
+                    run_id=run_id,
+                    progress_sink=progress_sink,
+                    logger=logger,
+                ),
+                run_supplemental_web_searches(
+                    query_plan=query_plan,
+                    web_search_dir=paths["web_search_dir"],
+                    run_id=run_id,
+                    progress_sink=progress_sink,
+                    logger=logger,
+                ),
+            )
+            write_web_evidence_cards(
+                web_search_dir=paths["web_search_dir"],
+                web_evidence_path=web_evidence_path,
                 run_id=run_id,
-                progress_sink=progress_sink,
-                logger=logger,
             )
             generate_transcript_fetch_plan_from_searches(
                 plan_path=transcript_fetch_plan_path,
@@ -2145,6 +2521,7 @@ async def run_agent(
                 article_manifest_path=article_manifest_path,
                 quality_report_path=quality_report_path,
                 search_dir=paths["search_dir"],
+                web_search_dir=paths["web_search_dir"],
                 transcript_dir=paths["transcript_dir"],
                 article_path=article_path,
                 run_id=run_id,
@@ -2192,6 +2569,7 @@ async def run_agent(
                 article_manifest_path=article_manifest_path,
                 quality_report_path=quality_report_path,
                 search_dir=paths["search_dir"],
+                web_search_dir=paths["web_search_dir"],
                 transcript_dir=paths["transcript_dir"],
                 article_path=article_path,
                 run_id=run_id,
@@ -2235,6 +2613,7 @@ async def run_agent(
             write_sources_manifest(
                 sources_manifest_path,
                 search_dir=paths["search_dir"],
+                web_search_dir=paths["web_search_dir"],
                 transcript_dir=paths["transcript_dir"],
                 article_path=article_path,
                 run_id=run_id,
@@ -2263,6 +2642,7 @@ async def run_agent(
             final_prompt = build_wide_article_prompt(
                 question=question,
                 evidence_manifest_path=evidence_manifest_path,
+                web_evidence_path=web_evidence_path if web_evidence_path.exists() else None,
                 article_path=article_path,
                 sources_manifest_path=sources_manifest_path,
             )
@@ -2276,6 +2656,7 @@ async def run_agent(
                 article_manifest_path=article_manifest_path,
                 quality_report_path=quality_report_path,
                 search_dir=paths["search_dir"],
+                web_search_dir=paths["web_search_dir"],
                 transcript_dir=paths["transcript_dir"],
                 article_path=article_path,
                 run_id=run_id,
@@ -2308,6 +2689,7 @@ async def run_agent(
             retry_prompt = build_wide_article_prompt(
                 question=question,
                 evidence_manifest_path=evidence_manifest_path,
+                web_evidence_path=web_evidence_path if web_evidence_path.exists() else None,
                 article_path=article_path,
                 sources_manifest_path=sources_manifest_path,
             )
@@ -2334,6 +2716,7 @@ async def run_agent(
                 article_manifest_path=article_manifest_path,
                 quality_report_path=quality_report_path,
                 search_dir=paths["search_dir"],
+                web_search_dir=paths["web_search_dir"],
                 transcript_dir=paths["transcript_dir"],
                 article_path=article_path,
                 run_id=run_id,
@@ -2365,6 +2748,7 @@ async def run_agent(
             article_manifest_path=article_manifest_path,
             quality_report_path=quality_report_path,
             search_dir=paths["search_dir"],
+            web_search_dir=paths["web_search_dir"],
             transcript_dir=paths["transcript_dir"],
             article_path=article_path,
             run_id=run_id,
@@ -2393,6 +2777,7 @@ async def run_agent(
     pre_normalize_sources_manifest = write_sources_manifest(
         sources_manifest_path,
         search_dir=paths["search_dir"],
+        web_search_dir=paths["web_search_dir"],
         transcript_dir=paths["transcript_dir"],
         article_path=article_path,
         run_id=run_id,
@@ -2417,6 +2802,7 @@ async def run_agent(
         article_manifest_path=article_manifest_path,
         quality_report_path=quality_report_path,
         search_dir=paths["search_dir"],
+        web_search_dir=paths["web_search_dir"],
         transcript_dir=paths["transcript_dir"],
         article_path=article_path,
         run_id=run_id,

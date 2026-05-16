@@ -14,10 +14,12 @@ from serpapi_client import SerpApiError  # noqa: E402
 from youtube_sources import (  # noqa: E402
     extract_related_search_queries,
     fetch_transcript_context,
+    normalize_web_search_results,
     normalize_video_enrichment,
     parse_metadata,
     prepare_research_discovery,
     search_candidates,
+    search_web_context,
     search_youtube_context,
 )
 
@@ -25,9 +27,28 @@ from youtube_sources import (  # noqa: E402
 class FakeClient:
     def __init__(self, fixtures: dict[str, dict]) -> None:
         self.fixtures = fixtures
+        self.search_queries: list[str] = []
 
     def search(self, query: str) -> dict:
+        self.search_queries.append(query)
         return self.fixtures["search"]
+
+    def web_search(self, query: str) -> dict:
+        return self.fixtures.get(
+            "web_search",
+            {
+                "organic_results": [
+                    {
+                        "position": 1,
+                        "title": "AI agents market update",
+                        "link": "https://example.com/ai-agents",
+                        "source": "Example",
+                        "date": "May 2026",
+                        "snippet": "AI agent adoption is expanding across enterprise workflows.",
+                    }
+                ]
+            },
+        )
 
     def metadata(self, video_id: str) -> dict:
         payload = dict(self.fixtures["metadata"])
@@ -161,6 +182,46 @@ class YouTubeSourcesTestCase(unittest.TestCase):
             self.assertEqual(manifest["search_count"], 3)
             self.assertEqual([item["round"] for item in manifest["searches"]], [1, 2, 3])
 
+    def test_search_web_context_writes_normalized_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            destination = search_web_context(
+                "ai agents company news",
+                output_dir=Path(tmpdir),
+                run_id="article-1",
+                client=FakeClient(self._fixtures()),
+            )
+            payload = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertTrue(destination.name.endswith(".web-search.json"))
+            self.assertEqual(payload["run_id"], "article-1")
+            self.assertEqual(payload["query"], "ai agents company news")
+            self.assertEqual(payload["engine"], "google")
+            self.assertEqual(payload["results"][0]["url"], "https://example.com/ai-agents")
+            self.assertEqual(payload["results"][0]["source"], "Example")
+            raw_path = Path(payload["raw_output_path"])
+            self.assertTrue(raw_path.name.endswith(".raw-web-search.json"))
+            manifest = json.loads((Path(tmpdir) / "web-search-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["search_count"], 1)
+            self.assertEqual(manifest["searches"][0]["result_count"], 1)
+
+    def test_normalize_web_search_results_supports_news_results(self) -> None:
+        results = normalize_web_search_results(
+            {
+                "news_results": [
+                    {
+                        "title": "Company announces new AI model",
+                        "link": "https://news.example.com/model",
+                        "source": "News Example",
+                        "date": "2 days ago",
+                        "snippet": "The company announced a new model for agents.",
+                    }
+                ]
+            },
+            "company ai model",
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["result_type"], "news_results")
+        self.assertEqual(results[0]["date"], "2 days ago")
+
     def test_fetch_transcript_context_writes_complete_source_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             destination = fetch_transcript_context(
@@ -221,7 +282,7 @@ class YouTubeSourcesTestCase(unittest.TestCase):
         self.assertEqual(candidates[0].video_id, "deep1234567")
         self.assertGreater(candidates[0].score, candidates[1].score)
 
-    def test_search_candidates_penalize_reaction_noise_when_original_is_available(self) -> None:
+    def test_search_candidates_rank_long_relevant_result_over_short_result(self) -> None:
         payload = {
             "video_results": [
                 {
@@ -248,7 +309,7 @@ class YouTubeSourcesTestCase(unittest.TestCase):
         candidates = search_candidates(payload, "Sam Altman GPT 5 interview")
         self.assertEqual(candidates[0].video_id, "orig1234567")
 
-    def test_search_candidates_prefer_direct_chinese_leader_sources_over_analysis(self) -> None:
+    def test_search_candidates_rank_stronger_query_overlap_over_position(self) -> None:
         payload = {
             "video_results": [
                 {
@@ -333,6 +394,36 @@ class YouTubeSourcesTestCase(unittest.TestCase):
         self.assertGreaterEqual(enrichment["enrichment_count"], 1)
         self.assertEqual(selection["transcript_policy"]["mode"], "adaptive")
         self.assertGreaterEqual(selection["candidate_count"], 1)
+
+    def test_prepare_research_discovery_uses_llm_planned_queries_when_provided(self) -> None:
+        client = FakeClient(self._fixtures())
+        planned_queries = [
+            {
+                "round": 1,
+                "query": "AI industry interview podcast 2026",
+                "intent": "LLM-generated discovery query",
+                "expected_source_type": "interview/podcast/talk",
+                "language": "en",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifacts = prepare_research_discovery(
+                input_value="搜集近三个月以来 ai 行业的重要访谈，播客，写一份该行业的研判报告 interview talk",
+                question="搜集近三个月以来 ai 行业的重要访谈，播客，写一份该行业的研判报告 interview talk",
+                research_mode="wide",
+                workspace_dir=root,
+                search_dir=root / "search-results",
+                run_id="article-1",
+                max_search_rounds=1,
+                planned_queries=planned_queries,
+                client=client,
+            )
+            plan = json.loads(artifacts["research_plan"].read_text(encoding="utf-8"))
+
+        self.assertEqual(client.search_queries[0], "AI industry interview podcast 2026")
+        self.assertEqual(plan["queries"], planned_queries)
+        self.assertNotIn("写一份", plan["queries"][0]["query"])
 
     def test_prepare_research_discovery_tolerates_related_video_without_duration(self) -> None:
         fixtures = self._fixtures()

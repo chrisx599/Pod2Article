@@ -16,6 +16,7 @@ from agents.podcast_article_agent import (
     build_agent_options,
     build_article_dir,
     build_evidence_prompt,
+    build_initial_search_query_prompt,
     build_prompt,
     build_query_planner_prompt,
     build_run_metadata,
@@ -32,9 +33,11 @@ from agents.podcast_article_agent import (
     run_agent,
     serialize_message,
     should_prepare_discovery,
+    _extract_json_object_from_text,
     _sdk_error_message,
     write_run_manifest,
     write_evidence_manifest,
+    write_web_evidence_cards,
     write_sources_manifest,
 )
 from agents.log_format import sanitize_for_log
@@ -98,14 +101,28 @@ class PodcastArticleAgentTests(unittest.TestCase):
             research_mode="wide",
         )
 
-        self.assertIn("Plan only supplemental YouTube search queries", prompt)
+        self.assertIn("Plan only supplemental YouTube and Web search queries", prompt)
         self.assertIn("Do not run Bash, Read, Write", prompt)
         self.assertIn("article-20260510T123000Z-abcdef12", prompt)
-        self.assertIn("supplemental_queries", prompt)
+        self.assertIn("supplemental_youtube_queries", prompt)
+        self.assertIn("supplemental_web_queries", prompt)
         self.assertIn("The Python runner, not you, will write the transcript fetch plan", prompt)
         self.assertIn("transcript-fetch-plan.json", prompt)
+        self.assertIn("Every query must be a search-engine query", prompt)
         self.assertNotIn("Write a coherent Markdown article", prompt)
         self.assertNotIn(f"search_youtube.py {shlex.quote(question)}", prompt)
+
+    def test_initial_search_query_prompt_rejects_task_sentences(self) -> None:
+        prompt = build_initial_search_query_prompt(
+            input_value="搜集近三个月以来 ai 行业的重要访谈，播客，写一份该行业的研判报告 interview talk",
+            question="搜集近三个月以来 ai 行业的重要访谈，播客，写一份该行业的研判报告 interview talk",
+        )
+
+        self.assertIn("Generate initial YouTube search queries", prompt)
+        self.assertIn("Each query must be a search-engine query", prompt)
+        self.assertIn("Bad query:", prompt)
+        self.assertIn("Good queries:", prompt)
+        self.assertIn("AI industry interview podcast 2026", prompt)
 
     def test_query_planner_prompt_includes_candidate_summary_without_tool_use(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -295,6 +312,7 @@ class PodcastArticleAgentTests(unittest.TestCase):
         article_prompt = build_wide_article_prompt(
             question="调研 AI 行业判断",
             evidence_manifest_path=Path("output/run/evidence/evidence-manifest.json"),
+            web_evidence_path=Path("output/run/web-search/web-evidence.json"),
             article_path=Path("output/run/articles/article.md"),
             sources_manifest_path=Path("output/run/sources-manifest.json"),
         )
@@ -304,7 +322,8 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertIn("Write one JSON object only to this exact path", evidence_prompt)
         self.assertIn("Read this evidence manifest first", article_prompt)
         self.assertIn("Use the evidence cards as the primary context", article_prompt)
-        self.assertIn("(罗福莉谈框架自进化 [00:55:33]", article_prompt)
+        self.assertIn("Use web evidence only for background", article_prompt)
+        self.assertIn("[马斯克 Lex Fridman 访谈 00:55:33]", article_prompt)
 
     def test_write_evidence_manifest_records_partial_failures(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -330,6 +349,42 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(manifest["success_count"], 1)
         self.assertEqual(manifest["failed_count"], 1)
 
+    def test_write_web_evidence_cards_collects_snippet_cards(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            web_dir = root / "web-search"
+            web_dir.mkdir()
+            (web_dir / "demo.web-search.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "article-1",
+                        "query": "ai agents market",
+                        "results": [
+                            {
+                                "rank": 1,
+                                "result_type": "organic_results",
+                                "title": "AI agents market update",
+                                "url": "https://example.com/ai-agents",
+                                "source": "Example",
+                                "date": "May 2026",
+                                "snippet": "AI agent adoption is expanding.",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = write_web_evidence_cards(
+                web_search_dir=web_dir,
+                web_evidence_path=web_dir / "web-evidence.json",
+                run_id="article-1",
+            )
+
+        self.assertEqual(manifest["card_count"], 1)
+        self.assertEqual(manifest["cards"][0]["source_kind"], "web")
+        self.assertEqual(manifest["cards"][0]["url"], "https://example.com/ai-agents")
+
     def test_log_sanitizer_preserves_usage_token_counts(self) -> None:
         payload = sanitize_for_log(
             {
@@ -348,6 +403,17 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(payload["model_usage"]["deepseek-v4-pro"]["inputTokens"], 123)
         self.assertEqual(payload["model_usage"]["deepseek-v4-pro"]["outputTokens"], 45)
         self.assertEqual(payload["model_usage"]["deepseek-v4-pro"]["cacheReadInputTokens"], 67)
+
+    def test_extract_json_object_from_text_handles_duplicated_sdk_json_messages(self) -> None:
+        text = (
+            '{"schema_version": 1, "supplemental_web_queries": [{"query": "ai timeline"}]}\n'
+            '{"schema_version": 1, "supplemental_web_queries": [{"query": "ai timeline"}]}'
+        )
+
+        payload = _extract_json_object_from_text(text)
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["supplemental_web_queries"][0]["query"], "ai timeline")
 
     def test_find_transcript_context_returns_latest_non_empty_file(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -389,11 +455,11 @@ class PodcastArticleAgentTests(unittest.TestCase):
             text = article_path.read_text(encoding="utf-8")
 
         self.assertEqual(replacement_count, 4)
-        self.assertIn("(姚顺宇访谈 [00:01:29](https://www.youtube.com/watch?v=hmtuvNfytjM&t=89s))", text)
-        self.assertIn("(姚顺宇访谈 [00:02:00](https://www.youtube.com/watch?v=hmtuvNfytjM&t=120s))", text)
-        self.assertIn("(姚顺宇访谈 [00:03:00](https://www.youtube.com/watch?v=hmtuvNfytjM&t=180s))", text)
+        self.assertIn("[姚顺宇访谈 00:01:29](https://www.youtube.com/watch?v=hmtuvNfytjM&t=89s)", text)
+        self.assertIn("[姚顺宇访谈 00:02:00](https://www.youtube.com/watch?v=hmtuvNfytjM&t=120s)", text)
+        self.assertIn("[姚顺宇访谈 00:03:00](https://www.youtube.com/watch?v=hmtuvNfytjM&t=180s)", text)
         self.assertIn(
-            "(姚顺宇谈模型同质化 [01:02:03](https://www.youtube.com/watch?v=hmtuvNfytjM&amp;t=3723s))",
+            "[姚顺宇访谈 01:02:03](https://www.youtube.com/watch?v=hmtuvNfytjM&amp;t=3723s)",
             text,
         )
         self.assertIn("[source](https://www.youtube.com/watch?v=hmtuvNfytjM)", text)
@@ -402,7 +468,7 @@ class PodcastArticleAgentTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             article_path = Path(tmpdir) / "article.md"
             article_path.write_text(
-                '- 一条很长的列表正文，后面已有短介绍 (姚顺宇访谈 [00:09:23](https://www.youtube.com/watch?v=hmtuvNfytjM&t=563s))',
+                '- 一条很长的列表正文，后面已有短介绍 [姚顺宇访谈 00:09:23](https://www.youtube.com/watch?v=hmtuvNfytjM&t=563s)',
                 encoding="utf-8",
             )
 
@@ -422,19 +488,72 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(replacement_count, 0)
         self.assertEqual(text.count("姚顺宇访谈"), 1)
 
-    def test_normalize_youtube_timestamp_link_text_wraps_existing_short_cue(self) -> None:
+    def test_normalize_youtube_timestamp_link_text_collapses_existing_short_cue_wrapper(self) -> None:
         with TemporaryDirectory() as tmpdir:
             article_path = Path(tmpdir) / "article.md"
             article_path.write_text(
-                '已有短介绍 姚顺宇访谈 [00:09:23](https://www.youtube.com/watch?v=hmtuvNfytjM&t=563s)',
+                '已有短介绍 (姚顺宇访谈 [00:09:23](https://www.youtube.com/watch?v=hmtuvNfytjM&t=563s))',
                 encoding="utf-8",
             )
 
             replacement_count = normalize_youtube_timestamp_link_text(article_path)
             text = article_path.read_text(encoding="utf-8")
 
+        self.assertEqual(replacement_count, 2)
+        self.assertIn("[姚顺宇访谈 00:09:23](https://www.youtube.com/watch?v=hmtuvNfytjM&t=563s)", text)
+        self.assertNotIn("(姚顺宇访谈 [", text)
+
+    def test_normalize_youtube_timestamp_link_text_collapses_nested_old_wrapper_with_consistent_video_cue(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "article.md"
+            article_path.write_text(
+                "（NVIDIA 全员使用 AI (编程 [00:46:45](https://www.youtube.com/watch?v=PirWDBZlrVg&t=2805s))）",
+                encoding="utf-8",
+            )
+
+            replacement_count = normalize_youtube_timestamp_link_text(
+                article_path,
+                sources_manifest={
+                    "sources": [
+                        {
+                            "video_id": "PirWDBZlrVg",
+                            "title": "NVIDIA 开发者大会：黄仁勋谈 AI 编程",
+                        }
+                    ]
+                },
+            )
+            text = article_path.read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(replacement_count, 2)
+        self.assertIn("[NVIDIA 开发者大会 00:46:45](https://www.youtube.com/watch?v=PirWDBZlrVg&t=2805s)", text)
+        self.assertNotIn("[00:46:45]", text)
+
+    def test_normalize_youtube_timestamp_link_text_uses_more_complete_title_cue(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            article_path = Path(tmpdir) / "article.md"
+            article_path.write_text(
+                "[00:17:31](https://www.youtube.com/watch?v=cyZeAw8DLew&t=1051s)",
+                encoding="utf-8",
+            )
+
+            replacement_count = normalize_youtube_timestamp_link_text(
+                article_path,
+                sources_manifest={
+                    "sources": [
+                        {
+                            "video_id": "cyZeAw8DLew",
+                            "title": "深度对话00后CEO，重新定义 AI 原生公司与产品",
+                        }
+                    ]
+                },
+            )
+            text = article_path.read_text(encoding="utf-8")
+
         self.assertEqual(replacement_count, 1)
-        self.assertIn("(姚顺宇访谈 [00:09:23](https://www.youtube.com/watch?v=hmtuvNfytjM&t=563s))", text)
+        self.assertIn(
+            "[深度对话00后CEO，重新定义 AI 原生公司与产品 00:17:31](https://www.youtube.com/watch?v=cyZeAw8DLew&t=1051s)",
+            text,
+        )
 
     def test_write_sources_manifest_filters_by_run_id(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -553,7 +672,7 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(article_manifest["referenced_video_ids"], ["hmtuvNfytjM"])
         self.assertEqual(quality_report["status"], "passed")
         self.assertEqual(quality_report["issue_count"], 0)
-        self.assertIn("[00:00:00]", article_text)
+        self.assertIn("[Demo 00:00:00]", article_text)
         phases = [event["phase"] for event in events]
         self.assertIn("source_fetch", phases)
         self.assertIn("article_write", phases)
@@ -561,6 +680,7 @@ class PodcastArticleAgentTests(unittest.TestCase):
     def test_run_agent_wide_extracts_evidence_before_article_write(self) -> None:
         events: list[dict[str, object]] = []
         prompts: list[str] = []
+        discovery_inputs: dict[str, object] = {}
 
         def fake_prepare_discovery(
             *,
@@ -570,7 +690,9 @@ class PodcastArticleAgentTests(unittest.TestCase):
             workspace_dir: Path,
             search_dir: Path,
             run_id: str,
+            planned_queries: list[dict[str, object]] | None = None,
         ) -> dict[str, Path]:
+            discovery_inputs["planned_queries"] = planned_queries
             search_dir.mkdir(parents=True, exist_ok=True)
             for index in range(2):
                 (search_dir / f"demo-{index}.search.json").write_text(
@@ -622,12 +744,42 @@ class PodcastArticleAgentTests(unittest.TestCase):
 
         async def fake_query(prompt: str, options: object):
             prompts.append(prompt)
-            if "Plan only supplemental YouTube search queries" in prompt:
+            if "Generate initial YouTube search queries" in prompt:
                 await asyncio.sleep(0)
                 yield FakeResultMessage(
                     is_error=False,
                     api_error_status=None,
-                    result=json.dumps({"schema_version": 1, "supplemental_queries": []}),
+                    result=json.dumps(
+                        {
+                            "schema_version": 1,
+                            "youtube_search_queries": [
+                                {
+                                    "query": "AI industry interview podcast 2026",
+                                    "reason": "broad English interview discovery",
+                                    "language": "en",
+                                },
+                                {
+                                    "query": "人工智能 行业 访谈 播客 2026",
+                                    "reason": "Chinese interview discovery",
+                                    "language": "zh",
+                                },
+                            ],
+                        }
+                    ),
+                )
+                return
+            if "Plan only supplemental YouTube and Web search queries" in prompt:
+                await asyncio.sleep(0)
+                yield FakeResultMessage(
+                    is_error=False,
+                    api_error_status=None,
+                    result=json.dumps(
+                        {
+                            "schema_version": 1,
+                            "supplemental_youtube_queries": [],
+                            "supplemental_web_queries": [],
+                        }
+                    ),
                 )
                 return
             elif "Extract compact, question-focused evidence cards" in prompt:
@@ -669,7 +821,7 @@ class PodcastArticleAgentTests(unittest.TestCase):
                 article_path = Path(prompt.split("Write the final Markdown article only to this exact path:")[1].splitlines()[1])
                 article_path.parent.mkdir(parents=True, exist_ok=True)
                 article_path.write_text(
-                    "# Wide Demo\n\n行业判断来自多条证据。(Demo观点 [00:00:00](https://www.youtube.com/watch?v=widevideo00&t=0s))\n",
+                    "# Wide Demo\n\n行业判断来自多条证据。[Demo 0 00:00:00](https://www.youtube.com/watch?v=widevideo00&t=0s)\n",
                     encoding="utf-8",
                 )
             await asyncio.sleep(0)
@@ -732,10 +884,15 @@ class PodcastArticleAgentTests(unittest.TestCase):
                                 )
                                 quality_report = json.loads((workspace_dir / "quality-report.json").read_text(encoding="utf-8"))
 
-        self.assertTrue(any("Plan only supplemental YouTube search queries" in prompt for prompt in prompts))
+        self.assertTrue(any("Plan only supplemental YouTube and Web search queries" in prompt for prompt in prompts))
+        self.assertTrue(any("Generate initial YouTube search queries" in prompt for prompt in prompts))
         self.assertEqual(len([prompt for prompt in prompts if "Extract compact, question-focused evidence cards" in prompt]), 2)
         self.assertTrue(any("Write the final grounded wide video deep research article" in prompt for prompt in prompts))
+        planned_queries = discovery_inputs["planned_queries"]
+        self.assertIsInstance(planned_queries, list)
+        self.assertEqual(planned_queries[0]["query"], "AI industry interview podcast 2026")
         self.assertEqual(query_plan["supplemental_queries"], [])
+        self.assertEqual(query_plan["supplemental_web_queries"], [])
         self.assertEqual(evidence_manifest["success_count"], 2)
         self.assertEqual(fetch_manifest["success_count"], 2)
         self.assertEqual(evidence_manifest["failed_count"], 0)
