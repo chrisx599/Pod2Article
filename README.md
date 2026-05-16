@@ -18,9 +18,10 @@ SERPAPI_API_KEY=your-serpapi-api-key
 ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
 ANTHROPIC_API_KEY=your-deepseek-api-key
 CLAUDE_AGENT_MODEL=deepseek-v4-pro
+EVIDENCE_AGENT_MODEL=deepseek-v4-flash
 ```
 
-`ANTHROPIC_API_KEY` should be a DeepSeek API key when `ANTHROPIC_BASE_URL` points to DeepSeek. `deepseek-v4-flash` can be used instead for lower-cost runs.
+`ANTHROPIC_API_KEY` should be a DeepSeek API key when `ANTHROPIC_BASE_URL` points to DeepSeek. `deepseek-v4-flash` can be used instead for lower-cost runs. `EVIDENCE_AGENT_MODEL` is optional; when set, only the per-transcript evidence extraction subagents use that model, while final synthesis keeps using `CLAUDE_AGENT_MODEL`.
 
 Run the Agent directly:
 
@@ -33,7 +34,12 @@ scripts/agent/run_podcast_article_agent.sh \
 The runner writes runtime data under `output/agent/<source-id>/`:
 
 ```text
+query-plan.json
+transcript-fetch-plan.json
+transcript-fetch-manifest.json
 transcripts/*.transcript.json
+evidence/*.evidence.json
+evidence/evidence-manifest.json
 articles/article-<timestamp>-<id>/article.md
 ```
 

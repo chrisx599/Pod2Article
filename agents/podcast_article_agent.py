@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 import json
@@ -10,7 +11,7 @@ from pathlib import Path
 import re
 import shlex
 import sys
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urlparse
 import uuid
 
@@ -44,7 +45,15 @@ DEFAULT_LOG_DIR = Path(DEFAULT_OUTPUT_DIR) / "logs"
 AGENT_ENV_PATH = Path(__file__).resolve().parent / ".env"
 SKILL_NAME = "podcast-to-article"
 MODEL_ENV_KEYS = ("CLAUDE_AGENT_MODEL", "DEFAULT_MODEL")
-LOG_ENV_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_AGENT_MODEL", "DEFAULT_MODEL", "SERPAPI_API_KEY")
+EVIDENCE_MODEL_ENV_KEYS = ("EVIDENCE_AGENT_MODEL",)
+LOG_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_AGENT_MODEL",
+    "EVIDENCE_AGENT_MODEL",
+    "DEFAULT_MODEL",
+    "SERPAPI_API_KEY",
+)
 CLAUDE_CODE_AUTH_ENV_KEYS = ("ANTHROPIC_AUTH_TOKEN",)
 ProgressSink = Callable[[dict[str, object]], None]
 ARTIFACT_PROGRESS_POLL_SECONDS = 0.5
@@ -56,10 +65,21 @@ QUALITY_REPORT_FILENAME = "quality-report.json"
 RESEARCH_PLAN_FILENAME = "research-plan.json"
 VIDEO_ENRICHMENT_MANIFEST_FILENAME = "video-enrichment-manifest.json"
 SELECTION_MANIFEST_FILENAME = "selection-manifest.json"
+EVIDENCE_DIRNAME = "evidence"
+EVIDENCE_MANIFEST_FILENAME = "evidence-manifest.json"
+EVIDENCE_MAX_CONCURRENCY = 3
+TRANSCRIPT_FETCH_PLAN_FILENAME = "transcript-fetch-plan.json"
+TRANSCRIPT_FETCH_MANIFEST_FILENAME = "transcript-fetch-manifest.json"
+QUERY_PLAN_FILENAME = "query-plan.json"
+WIDE_TRANSCRIPT_TARGET_COUNT = 10
+WIDE_TRANSCRIPT_PROBE_LIMIT = 18
+WIDE_TRANSCRIPT_MAX_CONCURRENCY = 4
+WIDE_SUPPLEMENTAL_QUERY_COUNT = 4
+WIDE_SUPPLEMENTAL_SEARCH_MAX_CONCURRENCY = 4
 PODCAST_SCRIPTS_DIR = PROJECT_ROOT / "podcast-to-article" / "scripts"
 if str(PODCAST_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(PODCAST_SCRIPTS_DIR))
-from youtube_sources import prepare_research_discovery  # noqa: E402
+from youtube_sources import fetch_transcript_context, prepare_research_discovery, search_youtube_context  # noqa: E402
 
 
 def default_log_path() -> Path:
@@ -103,6 +123,7 @@ def build_workspace_paths(output_root: Path, source_id: str) -> dict[str, Path]:
         "workspace_dir": workspace_dir,
         "search_dir": workspace_dir / "search-results",
         "transcript_dir": workspace_dir / "transcripts",
+        "evidence_dir": workspace_dir / EVIDENCE_DIRNAME,
         "articles_root": workspace_dir / "articles",
     }
 
@@ -133,6 +154,7 @@ def build_prompt(
     research_plan_path: str | None = None,
     video_enrichment_manifest_path: str | None = None,
     selection_manifest_path: str | None = None,
+    transcript_fetch_plan_path: str | None = None,
 ) -> str:
     run_id_arg = f" --run-id {shlex.quote(run_id)}" if run_id else ""
     fetch_command = (
@@ -141,15 +163,8 @@ def build_prompt(
     )
     run_id_block = f"\nUse this exact run id:\n{run_id}\n" if run_id else ""
     if research_mode == "wide" or selection_manifest_path:
-        discovery_block = ""
-        if research_plan_path and video_enrichment_manifest_path and selection_manifest_path:
-            discovery_block = f"""
-Prebuilt SerpApi discovery artifacts:
-- research plan: {research_plan_path}
-- video enrichment manifest: {video_enrichment_manifest_path}
-- selection manifest: {selection_manifest_path}
-"""
-        return f"""Use the {SKILL_NAME} skill to produce a grounded wide video deep research article.
+        fetch_plan_path = transcript_fetch_plan_path or str(Path(workspace_dir) / TRANSCRIPT_FETCH_PLAN_FILENAME)
+        return f"""Use the {SKILL_NAME} skill. Plan only supplemental YouTube search queries for a grounded wide video deep research article.
 
 Research topic:
 {question}
@@ -166,41 +181,27 @@ Use this exact search output directory:
 Use this exact transcript output directory:
 {transcript_dir}
 {run_id_block}
-{discovery_block}
 
-Write the final Markdown article only to this exact path:
+Reserve this final Markdown article path for the later writing step:
 {article_path}
 
-Required adaptive wide-search workflow:
-1. Open the prebuilt discovery artifacts listed above when present. Also open `search-manifest.json` in the search output directory and the generated `.search.json` files for this run id.
-2. Use the ranked candidates and SerpApi YouTube Video API enrichment data to decide which videos need transcript review. There is no fixed transcript count target. Fetch and read as many transcript files as needed to answer the research topic comprehensively, then stop when additional transcripts would be redundant.
-   - Prefer substantive interviews, talks, panels, keynotes, or podcast episodes over short clips, reactions, trailers, and news snippets.
-   - Enforce source diversity when the topic is broad: prefer different speakers, channels, organizations, roles, and perspectives over multiple videos centered on the same person or event.
-   - For a question about what a group of people thinks, main sources should be first-person or event sources from that group: the leader speaking, being interviewed, joining a panel, or giving a talk.
-   - Use third-party analysis only as background context and avoid letting it replace direct in-scope sources.
-3. For every video you decide is needed, run the bundled transcript fetcher with the video URL. If a selected candidate has no transcript/subtitles, skip it and continue down the ranked candidates or run an additional targeted search if coverage is still weak:
-   python3 podcast-to-article/scripts/fetch_transcript.py "<selected-video-url>" --output-dir {shlex.quote(transcript_dir)}{run_id_arg}
-4. If the prebuilt candidate pool is insufficient, run the bundled YouTube search tool with a targeted supplemental query and then fetch any transcript you need:
-   python3 podcast-to-article/scripts/search_youtube.py "<supplemental-search-query>" --output-dir {shlex.quote(search_dir)}{run_id_arg}
-5. Open and read every generated `.transcript.json` file before drafting.
-6. Create source coverage notes before drafting: for each transcript, identify the speaker/channel, role, whether it is direct first-person evidence or third-party analysis, main claims, and where it adds a distinct perspective. Use every usable in-scope direct transcript in the synthesis unless it is clearly off-topic; if a transcript is excluded, state the exclusion reason in the article.
-7. Synthesize across the gathered transcripts. Compare recurring claims, changes over time, disagreements, and caveats when the source material supports them. Do not let one long transcript dominate a broad-topic article when other usable transcripts are available.
-8. Write a coherent Markdown article that answers the research topic and includes clickable YouTube timestamp links. Put each timestamp citation in parentheses with a very short source or claim cue followed by a timestamp-only link, exactly like `(罗福莉谈框架自进化 [00:55:33](https://www.youtube.com/watch?v=...&t=3333s))`. Do not use labels such as `▶ 12:34`, source names, or sentence fragments as the visible text inside timestamp links. For broad-topic articles, the title, introduction, and conclusion must reflect the actual source breadth; do not frame the article as one person's view unless only one usable transcript was acquired. If the gathered evidence is mostly third-party analysis rather than the requested group's direct statements, narrow the title and introduction to that limitation instead of presenting it as the group's collective view.
-9. Do not create article drafts in any other directory. Do not expose hidden reasoning.
+The Python runner, not you, will write the transcript fetch plan here:
+{fetch_plan_path}
 
-Required outputs:
-- one or more `.search.json` files under {search_dir}
-- `search-manifest.json` under {search_dir}
-- one or more `.transcript.json` files under {transcript_dir}
-- {article_path}
+Required workflow:
+1. Do not run Bash, Read, Write, search tools, or transcript fetchers.
+2. Return only a compact JSON object in your final message.
+3. Propose up to {WIDE_SUPPLEMENTAL_QUERY_COUNT} targeted supplemental YouTube search queries that would improve source breadth for this research topic.
+4. Focus on semantic gaps that generic search may miss: specific speakers, organizations, roles, English/Chinese balance, panels, podcasts, keynotes, or recency.
+5. Do not select videos and do not write transcript-fetch-plan.json; the Python runner will execute your queries, merge candidates, and fetch transcripts in parallel.
 
-If only one relevant transcript can be acquired, write the article from that transcript and state the coverage limitation in the article.
-
-At the end, print:
-search_queries: <prebuilt and supplemental search queries used>
-search: <paths to generated search json files>
-transcripts: <paths to generated transcript json files>
-article: {article_path}
+Return JSON exactly in this shape:
+{{
+  "schema_version": 1,
+  "supplemental_queries": [
+    {{"query": "<youtube search query>", "reason": "<brief reason>"}}
+  ]
+}}
 """
     return f"""Use the {SKILL_NAME} skill to produce a grounded video deep research article.
 
@@ -255,6 +256,134 @@ After writing the article, print the article path.
 """
 
 
+def build_evidence_prompt(*, question: str, transcript_path: Path, evidence_path: Path) -> str:
+    return f"""Extract compact, question-focused evidence cards from one YouTube transcript.
+
+Research request:
+{question}
+
+Read this transcript JSON:
+{transcript_path}
+
+Write one JSON object only to this exact path:
+{evidence_path}
+
+Required JSON schema:
+{{
+  "schema_version": 1,
+  "video_id": "<video id>",
+  "title": "<video title>",
+  "channel": "<channel>",
+  "source_kind": "<transcript or subtitles>",
+  "transcript_path": "{transcript_path}",
+  "relevance": "high|medium|low",
+  "coverage_note": "<brief note on transcript coverage and fit>",
+  "excluded": false,
+  "exclusion_reason": "",
+  "cards": [
+    {{
+      "claim": "<one source-grounded claim relevant to the request>",
+      "why_it_matters": "<why this evidence matters for the final article>",
+      "timestamp": "HH:MM:SS",
+      "start_sec": 0,
+      "url": "https://www.youtube.com/watch?v=<id>&t=<seconds>s",
+      "quote_or_paraphrase": "<short source-faithful quote or paraphrase>",
+      "source_cue": "<very short Chinese cue suitable before a timestamp link>"
+    }}
+  ]
+}}
+
+Rules:
+- Read the transcript before writing the JSON.
+- Prefer 4-8 high-signal cards when the transcript is relevant; use fewer for low-relevance sources.
+- Every card must include a valid timestamp, start_sec, and YouTube URL from the transcript.
+- Keep quote_or_paraphrase concise; do not copy long transcript passages.
+- Set excluded=true only when the transcript is clearly off-topic, low-quality, or duplicate evidence.
+- Do not write Markdown, an article, or any file except {evidence_path}.
+"""
+
+
+def build_wide_article_prompt(
+    *,
+    question: str,
+    evidence_manifest_path: Path,
+    article_path: Path,
+    sources_manifest_path: Path,
+) -> str:
+    return f"""Write the final grounded wide video deep research article from compact evidence cards.
+
+Research request:
+{question}
+
+Read this evidence manifest first:
+{evidence_manifest_path}
+
+Also read this source manifest for video titles, channels, and source cues:
+{sources_manifest_path}
+
+Write the final Markdown article only to this exact path:
+{article_path}
+
+Required workflow:
+1. Read `evidence-manifest.json`, then read every successful `.evidence.json` file listed there.
+2. Use the evidence cards as the primary context. Do not read full `.transcript.json` files unless the evidence is clearly insufficient for a specific claim; if you do, keep it narrowly targeted.
+3. Synthesize across sources. Compare recurring claims, changes over time, disagreements, and caveats when the evidence supports them.
+4. Do not let one long transcript dominate a broad-topic article when other usable evidence cards are available.
+5. Write a coherent Markdown article that answers the research request and includes clickable YouTube timestamp links.
+6. Put each timestamp citation in parentheses with a very short source or claim cue followed by a timestamp-only link, exactly like `(罗福莉谈框架自进化 [00:55:33](https://www.youtube.com/watch?v=...&t=3333s))`. Do not use labels such as `▶ 12:34`, source names, or sentence fragments as the visible text inside timestamp links.
+7. If evidence generation failed for some transcripts or useful sources were excluded, state the coverage limitation briefly in the article.
+8. Do not create article drafts in any other directory. Do not expose hidden reasoning.
+
+At the end, print:
+evidence: {evidence_manifest_path}
+article: {article_path}
+"""
+
+
+def _candidate_summary_for_query_planner(selection_manifest_path: Path, *, limit: int = 18) -> str:
+    selection_manifest = _read_json_object(selection_manifest_path) or {}
+    candidates = selection_manifest.get("selected_candidates")
+    if not isinstance(candidates, list):
+        return "No prebuilt candidates were available."
+    lines: list[str] = []
+    for index, candidate in enumerate(candidates[:limit], start=1):
+        if not isinstance(candidate, dict):
+            continue
+        title = str(candidate.get("title") or "").strip()
+        channel = str(candidate.get("channel") or "").strip()
+        published = str(candidate.get("published_date") or "").strip()
+        score = candidate.get("score")
+        video_id = str(candidate.get("video_id") or "").strip()
+        lines.append(f"{index}. {title} | {channel} | {published or 'date unknown'} | score={score} | {video_id}")
+    return "\n".join(lines) or "No prebuilt candidates were available."
+
+
+def build_query_planner_prompt(*, question: str, selection_manifest_path: Path) -> str:
+    return f"""Plan only supplemental YouTube search queries for a video deep research task.
+
+Research request:
+{question}
+
+Current candidate snapshot:
+{_candidate_summary_for_query_planner(selection_manifest_path)}
+
+Return only compact JSON:
+{{
+  "schema_version": 1,
+  "supplemental_queries": [
+    {{"query": "<youtube search query>", "reason": "<brief reason>"}}
+  ]
+}}
+
+Rules:
+- Do not use tools.
+- Do not select videos.
+- Do not write files.
+- Return at most {WIDE_SUPPLEMENTAL_QUERY_COUNT} queries.
+- Prefer queries that improve source diversity, recency, speaker diversity, and English/Chinese balance.
+"""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -291,6 +420,7 @@ def write_run_manifest(
     research_plan_path: Path | None = None,
     video_enrichment_manifest_path: Path | None = None,
     selection_manifest_path: Path | None = None,
+    evidence_manifest_path: Path | None = None,
 ) -> None:
     existing = _read_json_object(path) or {}
     created_at = (
@@ -298,6 +428,15 @@ def write_run_manifest(
         if existing.get("run_id") == run_id and isinstance(existing.get("created_at"), str)
         else _utc_now()
     )
+    resolved_sources_manifest_path = sources_manifest_path or paths["workspace_dir"] / SOURCES_MANIFEST_FILENAME
+    resolved_article_manifest_path = article_manifest_path or article_path.parent / ARTICLE_MANIFEST_FILENAME
+    resolved_quality_report_path = quality_report_path or paths["workspace_dir"] / QUALITY_REPORT_FILENAME
+    resolved_evidence_manifest_path = evidence_manifest_path or paths["evidence_dir"] / EVIDENCE_MANIFEST_FILENAME
+    resolved_research_plan_path = research_plan_path or paths["workspace_dir"] / RESEARCH_PLAN_FILENAME
+    resolved_video_enrichment_manifest_path = (
+        video_enrichment_manifest_path or paths["workspace_dir"] / VIDEO_ENRICHMENT_MANIFEST_FILENAME
+    )
+    resolved_selection_manifest_path = selection_manifest_path or paths["workspace_dir"] / SELECTION_MANIFEST_FILENAME
     payload: dict[str, object] = {
         "schema_version": 1,
         "run_id": run_id,
@@ -313,25 +452,22 @@ def write_run_manifest(
         "workspace_dir": str(paths["workspace_dir"]),
         "search_dir": str(paths["search_dir"]),
         "transcript_dir": str(paths["transcript_dir"]),
+        "evidence_dir": str(paths["evidence_dir"]),
         "articles_root": str(paths["articles_root"]),
         "article_path": str(article_path),
         "artifacts": {
             "run_manifest": str(path),
             "search_manifest": str(paths["search_dir"] / "search-manifest.json"),
-            "sources_manifest": str(sources_manifest_path or paths["workspace_dir"] / SOURCES_MANIFEST_FILENAME),
+            "sources_manifest": str(resolved_sources_manifest_path),
+            "query_plan": str(paths["workspace_dir"] / QUERY_PLAN_FILENAME),
+            "transcript_fetch_plan": str(paths["workspace_dir"] / TRANSCRIPT_FETCH_PLAN_FILENAME),
+            "transcript_fetch_manifest": str(paths["workspace_dir"] / TRANSCRIPT_FETCH_MANIFEST_FILENAME),
+            "evidence_manifest": str(resolved_evidence_manifest_path),
             "article": str(article_path),
         },
     }
     if error_message:
         payload["error_message"] = error_message
-    resolved_sources_manifest_path = sources_manifest_path or paths["workspace_dir"] / SOURCES_MANIFEST_FILENAME
-    resolved_article_manifest_path = article_manifest_path or article_path.parent / ARTICLE_MANIFEST_FILENAME
-    resolved_quality_report_path = quality_report_path or paths["workspace_dir"] / QUALITY_REPORT_FILENAME
-    resolved_research_plan_path = research_plan_path or paths["workspace_dir"] / RESEARCH_PLAN_FILENAME
-    resolved_video_enrichment_manifest_path = (
-        video_enrichment_manifest_path or paths["workspace_dir"] / VIDEO_ENRICHMENT_MANIFEST_FILENAME
-    )
-    resolved_selection_manifest_path = selection_manifest_path or paths["workspace_dir"] / SELECTION_MANIFEST_FILENAME
     artifacts = payload["artifacts"]
     if not isinstance(artifacts, dict):
         artifacts = {}
@@ -356,6 +492,12 @@ def write_run_manifest(
         if isinstance(summary, dict):
             summary["quality_status"] = quality_report.get("status")
             summary["quality_issue_count"] = quality_report.get("issue_count")
+    evidence_manifest = _read_json_object(resolved_evidence_manifest_path)
+    if evidence_manifest is not None:
+        summary = payload.setdefault("artifact_summary", {})
+        if isinstance(summary, dict):
+            summary["evidence_success_count"] = evidence_manifest.get("success_count")
+            summary["evidence_failed_count"] = evidence_manifest.get("failed_count")
     _write_json(path, payload)
 
 
@@ -820,6 +962,7 @@ def write_quality_report(
     research_plan_path: Path | None = None,
     video_enrichment_manifest_path: Path | None = None,
     selection_manifest_path: Path | None = None,
+    evidence_manifest_path: Path | None = None,
 ) -> dict[str, object]:
     issues: list[dict[str, object]] = []
 
@@ -833,6 +976,10 @@ def write_quality_report(
     timestamp_link_intro_issue_count = int((article_manifest or {}).get("timestamp_link_intro_issue_count") or 0)
     referenced_ids = set((article_manifest or {}).get("referenced_video_ids") or [])
     transcript_ids = set((article_manifest or {}).get("transcript_video_ids") or [])
+    evidence_manifest = _read_json_object(evidence_manifest_path) if evidence_manifest_path is not None else None
+    evidence_transcript_count = int((evidence_manifest or {}).get("transcript_count") or 0)
+    evidence_success_count = int((evidence_manifest or {}).get("success_count") or 0)
+    evidence_failed_count = int((evidence_manifest or {}).get("failed_count") or 0)
 
     if not article_path.exists() or article_path.stat().st_size == 0:
         add_issue("error", "article_missing", "article.md was not generated or is empty.")
@@ -861,6 +1008,17 @@ def write_quality_report(
             add_issue("warning", "video_enrichment_missing", "SerpApi video enrichment artifact is missing.")
         if selection_manifest_path is not None and not selection_manifest_path.exists():
             add_issue("warning", "selection_manifest_missing", "Selection candidate artifact is missing.")
+        if evidence_manifest_path is not None:
+            if not evidence_manifest_path.exists():
+                add_issue("warning", "evidence_manifest_missing", "Evidence extraction manifest is missing.")
+            elif evidence_success_count < 1:
+                add_issue("error", "evidence_generation_empty", "Evidence extraction did not produce usable evidence.")
+            elif evidence_failed_count:
+                add_issue(
+                    "warning",
+                    "evidence_generation_partial",
+                    "Some transcript evidence extraction jobs failed; article coverage may be partial.",
+                )
 
     missing_transcripts = sorted(referenced_ids - transcript_ids)
     if missing_transcripts:
@@ -886,6 +1044,9 @@ def write_quality_report(
         "article_path": str(article_path),
         "search_count": search_count,
         "transcript_count": transcript_count,
+        "evidence_transcript_count": evidence_transcript_count,
+        "evidence_success_count": evidence_success_count,
+        "evidence_failed_count": evidence_failed_count,
         "timestamp_link_count": timestamp_link_count,
         "timestamp_link_text_issue_count": timestamp_link_text_issue_count,
         "timestamp_link_intro_issue_count": timestamp_link_intro_issue_count,
@@ -898,6 +1059,8 @@ def write_quality_report(
         if selection_manifest is not None:
             report["selection_candidate_count"] = selection_manifest.get("candidate_count")
             report["search_round_count"] = selection_manifest.get("search_round_count")
+    if evidence_manifest is not None:
+        report["evidence_manifest_path"] = str(evidence_manifest_path)
     _write_json(path, report)
     return report
 
@@ -915,6 +1078,7 @@ def write_artifact_reports(
     research_plan_path: Path | None = None,
     video_enrichment_manifest_path: Path | None = None,
     selection_manifest_path: Path | None = None,
+    evidence_manifest_path: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
     sources_manifest = write_sources_manifest(
         sources_manifest_path,
@@ -939,6 +1103,7 @@ def write_artifact_reports(
         research_plan_path=research_plan_path,
         video_enrichment_manifest_path=video_enrichment_manifest_path,
         selection_manifest_path=selection_manifest_path,
+        evidence_manifest_path=evidence_manifest_path,
     )
     return sources_manifest, article_manifest, quality_report
 
@@ -974,6 +1139,14 @@ def resolve_model(env_values: dict[str, str]) -> str | None:
         if value and value.strip():
             return value.strip()
     return None
+
+
+def resolve_evidence_model(env_values: dict[str, str], fallback_model: str | None) -> str | None:
+    for key in EVIDENCE_MODEL_ENV_KEYS:
+        value = os.environ.get(key) or env_values.get(key)
+        if value and value.strip():
+            return value.strip()
+    return fallback_model
 
 
 def _masked_env_value(key: str, value: str | None) -> str | None:
@@ -1044,6 +1217,22 @@ def _iter_text_blocks(message: object) -> Iterable[str]:
             yield str(result)
 
 
+async def _consume_sdk_query_text(prompt: str, options: ClaudeAgentOptions, logger: object, event_name: str) -> tuple[str, str | None]:
+    texts: list[str] = []
+    sdk_error_message: str | None = None
+    try:
+        async for message in query(prompt=prompt, options=options):
+            sdk_error_message = _sdk_error_message(message) or sdk_error_message
+            logger.info(format_log_event(event_name, serialize_message(message)))
+            for text in _iter_text_blocks(message):
+                texts.append(text)
+                logger.info(format_log_text_block("message_text", text))
+                print(text)
+    except Exception as exc:
+        raise AgentRunError(sdk_error_message or str(exc)) from exc
+    return "\n".join(texts), sdk_error_message
+
+
 def _sdk_error_message(message: object) -> str | None:
     is_error = bool(getattr(message, "is_error", False))
     status = getattr(message, "api_error_status", None)
@@ -1098,6 +1287,602 @@ def find_transcript_context(transcript_dir: Path) -> Path | None:
     return transcripts[0] if transcripts else None
 
 
+def list_transcript_contexts(transcript_dir: Path, *, run_id: str | None = None) -> list[Path]:
+    if not transcript_dir.exists():
+        return []
+    paths = sorted(path for path in transcript_dir.glob("*.transcript.json") if path.stat().st_size > 0)
+    if run_id is None:
+        return paths
+    current_run_paths: list[Path] = []
+    for path in paths:
+        payload = _read_json_object(path)
+        if payload is not None and payload.get("run_id") == run_id:
+            current_run_paths.append(path)
+    return current_run_paths
+
+
+def _transcript_video_id(transcript_path: Path) -> str:
+    payload = _read_json_object(transcript_path) or {}
+    video = payload.get("video")
+    if isinstance(video, dict) and video.get("video_id"):
+        return str(video["video_id"])
+    return transcript_path.stem.removesuffix(".transcript")
+
+
+def _evidence_path_for_transcript(evidence_dir: Path, transcript_path: Path) -> Path:
+    return evidence_dir / f"{_slugify(_transcript_video_id(transcript_path), fallback=transcript_path.stem)}.evidence.json"
+
+
+def _video_url_from_id(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _transcript_fetch_candidates_from_payload(payload: dict[str, object]) -> list[dict[str, object]]:
+    raw_items: object = None
+    for key in ("selected_videos", "videos", "candidates", "selected_candidates"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            raw_items = value
+            break
+    if not isinstance(raw_items, list):
+        return []
+
+    candidates: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw_items, start=1):
+        if not isinstance(item, dict):
+            continue
+        raw_url = str(item.get("url") or item.get("link") or "")
+        video_id = str(item.get("video_id") or item.get("videoId") or extract_youtube_video_id(raw_url) or "").strip()
+        if not video_id or video_id in seen:
+            continue
+        seen.add(video_id)
+        candidates.append(
+            {
+                "video_id": video_id,
+                "url": raw_url or _video_url_from_id(video_id),
+                "title": str(item.get("title") or f"Video {video_id}"),
+                "channel": str(item.get("channel") or "Unknown channel"),
+                "priority": int(item.get("priority") or index) if str(item.get("priority") or index).isdigit() else index,
+                "reason": str(item.get("reason") or ""),
+                "score": item.get("score"),
+            }
+        )
+    return sorted(candidates, key=lambda item: (int(item.get("priority") or 999), -_safe_float(item.get("score"))))
+
+
+def transcript_fetch_candidates(
+    *,
+    plan_path: Path,
+    selection_manifest_path: Path,
+    limit: int = WIDE_TRANSCRIPT_PROBE_LIMIT,
+) -> list[dict[str, object]]:
+    plan = _read_json_object(plan_path)
+    candidates = _transcript_fetch_candidates_from_payload(plan or {})
+    if not candidates:
+        selection_manifest = _read_json_object(selection_manifest_path)
+        candidates = _transcript_fetch_candidates_from_payload(selection_manifest or {})
+    return candidates[:limit]
+
+
+def write_transcript_fetch_manifest(
+    path: Path,
+    *,
+    run_id: str,
+    candidates: list[dict[str, object]],
+    successes: list[dict[str, object]],
+    failures: list[dict[str, object]],
+) -> dict[str, object]:
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "generated_at": _utc_now(),
+        "run_id": run_id,
+        "candidate_count": len(candidates),
+        "success_count": len(successes),
+        "failed_count": len(failures),
+        "successes": successes,
+        "failures": failures,
+    }
+    _write_json(path, manifest)
+    return manifest
+
+
+def _extract_json_object_from_text(text: str) -> dict[str, object] | None:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped).strip()
+    try:
+        payload = json.loads(stripped)
+        return payload if isinstance(payload, dict) else None
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _supplemental_queries_from_payload(payload: dict[str, object] | None) -> list[dict[str, str]]:
+    raw_queries = (payload or {}).get("supplemental_queries")
+    if not isinstance(raw_queries, list):
+        return []
+    queries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_queries:
+        if isinstance(item, str):
+            query_text = item
+            reason = ""
+        elif isinstance(item, dict):
+            query_text = str(item.get("query") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+        else:
+            continue
+        normalized = re.sub(r"\s+", " ", query_text).strip()
+        key = normalized.casefold()
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        queries.append({"query": normalized, "reason": reason})
+        if len(queries) >= WIDE_SUPPLEMENTAL_QUERY_COUNT:
+            break
+    return queries
+
+
+def write_query_plan(path: Path, *, run_id: str, queries: list[dict[str, str]], raw_text: str) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "generated_at": _utc_now(),
+        "run_id": run_id,
+        "supplemental_queries": queries,
+        "raw_text": raw_text,
+    }
+    _write_json(path, payload)
+    return payload
+
+
+async def plan_supplemental_queries(
+    *,
+    question: str,
+    selection_manifest_path: Path,
+    query_plan_path: Path,
+    run_id: str,
+    options: ClaudeAgentOptions,
+    logger: object,
+) -> dict[str, object]:
+    prompt = build_query_planner_prompt(question=question, selection_manifest_path=selection_manifest_path)
+    logger.info(format_log_event("query_planner_prompt_ready", {"prompt_chars": len(prompt)}))
+    text, _ = await _consume_sdk_query_text(prompt, options, logger, "query_planner_sdk_message")
+    queries = _supplemental_queries_from_payload(_extract_json_object_from_text(text))
+    plan = write_query_plan(query_plan_path, run_id=run_id, queries=queries, raw_text=text)
+    logger.info(format_log_event("query_plan_ready", {"query_count": len(queries), "query_plan_path": str(query_plan_path)}))
+    return plan
+
+
+async def run_supplemental_searches(
+    *,
+    query_plan: dict[str, object],
+    search_dir: Path,
+    run_id: str,
+    progress_sink: ProgressSink | None,
+    logger: object,
+    max_concurrency: int = WIDE_SUPPLEMENTAL_SEARCH_MAX_CONCURRENCY,
+) -> list[str]:
+    queries = _supplemental_queries_from_payload(query_plan)
+    if not queries:
+        return []
+    _emit_progress(
+        progress_sink,
+        "phase_progress",
+        "source_fetch",
+        "正在并发执行补充 YouTube 搜索",
+        data={"query_count": len(queries), "max_concurrency": max_concurrency},
+    )
+    paths: list[str] = []
+    loop = asyncio.get_running_loop()
+
+    def run_pool() -> list[str]:
+        results: list[str] = []
+        with ThreadPoolExecutor(max_workers=max(1, max_concurrency)) as executor:
+            future_map = {
+                executor.submit(search_youtube_context, item["query"], output_dir=search_dir, run_id=run_id): item
+                for item in queries
+            }
+            for future in wait(future_map.keys()).done:
+                item = future_map[future]
+                try:
+                    results.append(str(future.result()))
+                except Exception as exc:
+                    logger.warning(format_log_event("supplemental_search_failed", {"query": item["query"], "error_message": str(exc)}))
+        return sorted(results)
+
+    paths = await loop.run_in_executor(None, run_pool)
+    logger.info(format_log_event("supplemental_searches_completed", {"search_count": len(paths), "paths": paths}))
+    return paths
+
+
+def _score_transcript_candidate(candidate: dict[str, object], *, rank: int) -> float:
+    score = _safe_float(candidate.get("score"))
+    title = str(candidate.get("title") or "").casefold()
+    channel = str(candidate.get("channel") or "").casefold()
+    published = str(candidate.get("published_date") or "").casefold()
+    bucket = str(candidate.get("source_bucket") or "")
+    if any(term in title for term in ("interview", "podcast", "访谈", "对话", "discussion", "debate", "keynote", "panel")):
+        score += 8.0
+    if any(term in title for term in ("ai", "agi", "agent", "llm", "人工智能", "大模型", "智能体")):
+        score += 6.0
+    if any(name in title or name in channel for name in ("sam altman", "dario", "demis", "jensen", "huang", "reid hoffman", "musk", "罗福莉", "田渊栋", "周鸿祎")):
+        score += 5.0
+    if any(term in published for term in ("day", "week", "month", "天", "周", "个月")):
+        score += 3.0
+    if bucket == "related_videos":
+        score -= 4.0
+    score -= rank * 0.05
+    return score
+
+
+def _search_candidates_from_files(search_dir: Path, *, run_id: str) -> list[dict[str, object]]:
+    candidates: dict[str, dict[str, object]] = {}
+    rank = 0
+    for path in sorted(search_dir.glob("*.search.json")):
+        payload = _read_json_object(path)
+        if payload is None or payload.get("run_id") != run_id:
+            continue
+        raw_candidates = payload.get("candidates")
+        if not isinstance(raw_candidates, list):
+            continue
+        for item in raw_candidates:
+            if not isinstance(item, dict) or not item.get("video_id"):
+                continue
+            rank += 1
+            video_id = str(item["video_id"])
+            candidate = dict(item)
+            candidate["priority_score"] = _score_transcript_candidate(candidate, rank=rank)
+            existing = candidates.get(video_id)
+            if existing is None or _safe_float(candidate["priority_score"]) > _safe_float(existing.get("priority_score")):
+                candidates[video_id] = candidate
+    return sorted(candidates.values(), key=lambda item: _safe_float(item.get("priority_score")), reverse=True)
+
+
+def generate_transcript_fetch_plan_from_searches(
+    *,
+    plan_path: Path,
+    search_dir: Path,
+    run_id: str,
+    limit: int = WIDE_TRANSCRIPT_PROBE_LIMIT,
+) -> dict[str, object]:
+    selected: list[dict[str, object]] = []
+    channel_counts: dict[str, int] = {}
+    for candidate in _search_candidates_from_files(search_dir, run_id=run_id):
+        channel = str(candidate.get("channel") or "Unknown channel")
+        if channel_counts.get(channel, 0) >= 2:
+            continue
+        video_id = str(candidate.get("video_id") or "")
+        if not video_id:
+            continue
+        channel_counts[channel] = channel_counts.get(channel, 0) + 1
+        selected.append(
+            {
+                "video_id": video_id,
+                "url": str(candidate.get("url") or _video_url_from_id(video_id)),
+                "title": str(candidate.get("title") or f"Video {video_id}"),
+                "channel": channel,
+                "priority": len(selected) + 1,
+                "reason": "programmatic selection from merged search candidates",
+                "score": candidate.get("priority_score"),
+            }
+        )
+        if len(selected) >= limit:
+            break
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "generated_at": _utc_now(),
+        "run_id": run_id,
+        "selected_videos": selected,
+    }
+    _write_json(plan_path, payload)
+    return payload
+
+
+def _fetch_one_planned_transcript(
+    candidate: dict[str, object],
+    *,
+    transcript_dir: Path,
+    run_id: str,
+) -> dict[str, object]:
+    raw_input = str(candidate.get("url") or _video_url_from_id(str(candidate["video_id"])))
+    output_path = fetch_transcript_context(raw_input, output_dir=transcript_dir, run_id=run_id)
+    payload = _read_json_object(output_path) or {}
+    video = payload.get("video") if isinstance(payload.get("video"), dict) else {}
+    return {
+        "video_id": str(video.get("video_id") or candidate.get("video_id")),
+        "title": str(video.get("title") or candidate.get("title") or ""),
+        "channel": str(video.get("channel") or candidate.get("channel") or ""),
+        "path": str(output_path),
+        "source_kind": str(payload.get("source_kind") or ""),
+    }
+
+
+async def fetch_wide_transcripts_from_plan(
+    *,
+    plan_path: Path,
+    selection_manifest_path: Path,
+    transcript_dir: Path,
+    manifest_path: Path,
+    run_id: str,
+    progress_sink: ProgressSink | None,
+    logger: object,
+    target_count: int = WIDE_TRANSCRIPT_TARGET_COUNT,
+    probe_limit: int = WIDE_TRANSCRIPT_PROBE_LIMIT,
+    max_concurrency: int = WIDE_TRANSCRIPT_MAX_CONCURRENCY,
+) -> dict[str, object]:
+    candidates = transcript_fetch_candidates(
+        plan_path=plan_path,
+        selection_manifest_path=selection_manifest_path,
+        limit=probe_limit,
+    )
+    existing_paths = list_transcript_contexts(transcript_dir, run_id=run_id)
+    existing_ids = {_transcript_video_id(path) for path in existing_paths}
+    candidates = [candidate for candidate in candidates if str(candidate.get("video_id")) not in existing_ids]
+    _emit_progress(
+        progress_sink,
+        "phase_started",
+        "source_fetch",
+        "正在并发获取计划中的转录上下文",
+        data={"candidate_count": len(candidates), "target_count": target_count, "max_concurrency": max_concurrency},
+    )
+
+    successes: list[dict[str, object]] = [
+        {"video_id": _transcript_video_id(path), "path": str(path), "reused": True}
+        for path in existing_paths
+    ]
+    failures: list[dict[str, object]] = []
+    if not candidates or len(successes) >= target_count:
+        return write_transcript_fetch_manifest(
+            manifest_path,
+            run_id=run_id,
+            candidates=candidates,
+            successes=successes,
+            failures=failures,
+        )
+
+    loop = asyncio.get_running_loop()
+
+    def run_pool() -> dict[str, object]:
+        pending: set[Future[dict[str, object]]] = set()
+        future_candidates: dict[Future[dict[str, object]], dict[str, object]] = {}
+        next_index = 0
+
+        def submit_next(executor: ThreadPoolExecutor) -> None:
+            nonlocal next_index
+            while len(pending) < max(1, max_concurrency) and next_index < len(candidates):
+                candidate = candidates[next_index]
+                next_index += 1
+                future = executor.submit(
+                    _fetch_one_planned_transcript,
+                    candidate,
+                    transcript_dir=transcript_dir,
+                    run_id=run_id,
+                )
+                pending.add(future)
+                future_candidates[future] = candidate
+
+        with ThreadPoolExecutor(max_workers=max(1, max_concurrency)) as executor:
+            submit_next(executor)
+            while pending and len(successes) < target_count:
+                done, pending_remainder = wait(pending, return_when=FIRST_COMPLETED)
+                pending = set(pending_remainder)
+                for future in done:
+                    candidate = future_candidates.pop(future, {})
+                    try:
+                        successes.append(future.result())
+                    except Exception as exc:
+                        failures.append(
+                            {
+                                "video_id": str(candidate.get("video_id") or ""),
+                                "url": str(candidate.get("url") or ""),
+                                "title": str(candidate.get("title") or ""),
+                                "error_message": str(exc),
+                            }
+                        )
+                    _emit_progress(
+                        progress_sink,
+                        "phase_progress",
+                        "source_fetch",
+                        "并发转录获取进度",
+                        data={
+                            "completed": len(successes) + len(failures),
+                            "success_count": len(successes),
+                            "failed_count": len(failures),
+                            "target_count": target_count,
+                        },
+                    )
+                submit_next(executor)
+            for future in pending:
+                future.cancel()
+
+        return write_transcript_fetch_manifest(
+            manifest_path,
+            run_id=run_id,
+            candidates=candidates,
+            successes=successes,
+            failures=failures,
+        )
+
+    manifest = await loop.run_in_executor(None, run_pool)
+    logger.info(format_log_event("parallel_transcript_fetch_completed", manifest))
+    return manifest
+
+
+def write_evidence_manifest(
+    path: Path,
+    *,
+    run_id: str,
+    transcript_paths: list[Path],
+    successes: list[dict[str, object]],
+    failures: list[dict[str, object]],
+) -> dict[str, object]:
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "generated_at": _utc_now(),
+        "run_id": run_id,
+        "transcript_count": len(transcript_paths),
+        "success_count": len(successes),
+        "failed_count": len(failures),
+        "evidence_files": successes,
+        "failures": failures,
+    }
+    _write_json(path, manifest)
+    return manifest
+
+
+async def _consume_sdk_query(prompt: str, options: ClaudeAgentOptions, logger: object, event_name: str) -> str | None:
+    _, sdk_error_message = await _consume_sdk_query_text(prompt, options, logger, event_name)
+    return sdk_error_message
+
+
+async def _extract_one_evidence(
+    *,
+    question: str,
+    transcript_path: Path,
+    evidence_dir: Path,
+    options: ClaudeAgentOptions,
+    logger: object,
+) -> dict[str, object]:
+    evidence_path = _evidence_path_for_transcript(evidence_dir, transcript_path)
+    prompt = build_evidence_prompt(
+        question=question,
+        transcript_path=transcript_path,
+        evidence_path=evidence_path,
+    )
+    logger.info(
+        format_log_event(
+            "evidence_extract_started",
+            {"transcript_path": str(transcript_path), "evidence_path": str(evidence_path), "prompt_chars": len(prompt)},
+        )
+    )
+    sdk_error_message: str | None = None
+    try:
+        sdk_error_message = await _consume_sdk_query(prompt, options, logger, "evidence_sdk_message")
+    except Exception as exc:
+        error_message = sdk_error_message or str(exc)
+        logger.exception(format_log_event("evidence_extract_failed", {"transcript_path": str(transcript_path), "error_message": error_message}))
+        raise AgentRunError(error_message) from exc
+
+    payload = _read_json_object(evidence_path)
+    if payload is None:
+        raise AgentRunError(f"evidence file was not generated or is invalid JSON: {evidence_path}")
+    video_id = str(payload.get("video_id") or _transcript_video_id(transcript_path))
+    cards = payload.get("cards")
+    card_count = len(cards) if isinstance(cards, list) else 0
+    return {
+        "video_id": video_id,
+        "path": str(evidence_path),
+        "transcript_path": str(transcript_path),
+        "relevance": payload.get("relevance"),
+        "excluded": bool(payload.get("excluded", False)),
+        "card_count": card_count,
+    }
+
+
+async def extract_evidence_cards(
+    *,
+    question: str,
+    transcript_dir: Path,
+    evidence_dir: Path,
+    evidence_manifest_path: Path,
+    run_id: str,
+    options: ClaudeAgentOptions,
+    logger: object,
+    progress_sink: ProgressSink | None,
+    max_concurrency: int = EVIDENCE_MAX_CONCURRENCY,
+) -> dict[str, object]:
+    transcript_paths = list_transcript_contexts(transcript_dir, run_id=run_id)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    _emit_progress(
+        progress_sink,
+        "phase_started",
+        "evidence_extract",
+        "正在提取核心证据卡片",
+        data={"transcript_count": len(transcript_paths), "evidence_dir": str(evidence_dir)},
+    )
+    if not transcript_paths:
+        write_evidence_manifest(
+            evidence_manifest_path,
+            run_id=run_id,
+            transcript_paths=[],
+            successes=[],
+            failures=[],
+        )
+        raise AgentRunError("no transcript artifacts available for evidence extraction")
+
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+    successes: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    completed = 0
+
+    async def run_one(transcript_path: Path) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        async with semaphore:
+            try:
+                return (
+                    await _extract_one_evidence(
+                        question=question,
+                        transcript_path=transcript_path,
+                        evidence_dir=evidence_dir,
+                        options=options,
+                        logger=logger,
+                    ),
+                    None,
+                )
+            except Exception as exc:
+                return None, {
+                    "transcript_path": str(transcript_path),
+                    "video_id": _transcript_video_id(transcript_path),
+                    "error_message": str(exc),
+                }
+
+    tasks = [asyncio.create_task(run_one(path)) for path in transcript_paths]
+    for task in asyncio.as_completed(tasks):
+        success, failure = await task
+        completed += 1
+        if success is not None:
+            successes.append(success)
+        if failure is not None:
+            failures.append(failure)
+        _emit_progress(
+            progress_sink,
+            "phase_progress",
+            "evidence_extract",
+            "核心证据卡片提取进度",
+            data={"completed": completed, "total": len(transcript_paths), "success_count": len(successes), "failed_count": len(failures)},
+        )
+
+    successes.sort(key=lambda item: str(item.get("video_id")))
+    failures.sort(key=lambda item: str(item.get("video_id")))
+    manifest = write_evidence_manifest(
+        evidence_manifest_path,
+        run_id=run_id,
+        transcript_paths=transcript_paths,
+        successes=successes,
+        failures=failures,
+    )
+    logger.info(format_log_event("evidence_extract_completed", manifest))
+    if not successes:
+        raise AgentRunError("evidence extraction failed for every transcript")
+    return manifest
+
+
 def should_prepare_discovery(input_value: str, research_mode: str) -> bool:
     if research_mode == "wide":
         return True
@@ -1110,6 +1895,7 @@ async def _watch_artifact_progress(
     article_path: Path,
     progress_sink: ProgressSink | None,
     stop_event: asyncio.Event,
+    start_article_on_transcript: bool = True,
     poll_seconds: float = ARTIFACT_PROGRESS_POLL_SECONDS,
 ) -> None:
     emitted_transcript = False
@@ -1127,13 +1913,14 @@ async def _watch_artifact_progress(
                 "已获取转录上下文",
                 data={"transcript_path": str(transcript_path)},
             )
-            _emit_progress(
-                progress_sink,
-                "phase_started",
-                "article_write",
-                "正在撰写深度文章",
-                data={"article_path": str(article_path)},
-            )
+            if start_article_on_transcript:
+                _emit_progress(
+                    progress_sink,
+                    "phase_started",
+                    "article_write",
+                    "正在撰写深度文章",
+                    data={"article_path": str(article_path)},
+                )
             emitted_transcript = True
 
         if article_path.exists() and article_path.stat().st_size > 0 and not emitted_article:
@@ -1183,6 +1970,7 @@ async def run_agent(
     paths = build_workspace_paths(output_root, source_id)
     paths["search_dir"].mkdir(parents=True, exist_ok=True)
     paths["transcript_dir"].mkdir(parents=True, exist_ok=True)
+    paths["evidence_dir"].mkdir(parents=True, exist_ok=True)
     paths["articles_root"].mkdir(parents=True, exist_ok=True)
     article_dir = build_article_dir(paths["articles_root"])
     article_dir.mkdir(parents=True, exist_ok=False)
@@ -1192,6 +1980,10 @@ async def run_agent(
     sources_manifest_path = paths["workspace_dir"] / SOURCES_MANIFEST_FILENAME
     article_manifest_path = article_dir / ARTICLE_MANIFEST_FILENAME
     quality_report_path = paths["workspace_dir"] / QUALITY_REPORT_FILENAME
+    evidence_manifest_path = paths["evidence_dir"] / EVIDENCE_MANIFEST_FILENAME
+    query_plan_path = paths["workspace_dir"] / QUERY_PLAN_FILENAME
+    transcript_fetch_plan_path = paths["workspace_dir"] / TRANSCRIPT_FETCH_PLAN_FILENAME
+    transcript_fetch_manifest_path = paths["workspace_dir"] / TRANSCRIPT_FETCH_MANIFEST_FILENAME
     research_plan_path = paths["workspace_dir"] / RESEARCH_PLAN_FILENAME
     video_enrichment_manifest_path = paths["workspace_dir"] / VIDEO_ENRICHMENT_MANIFEST_FILENAME
     selection_manifest_path = paths["workspace_dir"] / SELECTION_MANIFEST_FILENAME
@@ -1209,6 +2001,7 @@ async def run_agent(
         sources_manifest_path=sources_manifest_path,
         article_manifest_path=article_manifest_path,
         quality_report_path=quality_report_path,
+        evidence_manifest_path=evidence_manifest_path,
         research_plan_path=research_plan_path,
         video_enrichment_manifest_path=video_enrichment_manifest_path,
         selection_manifest_path=selection_manifest_path,
@@ -1275,28 +2068,23 @@ async def run_agent(
             )
             raise
 
-    prompt = build_prompt(
-        input_value=input_value,
-        question=question,
-        workspace_dir=str(paths["workspace_dir"]),
-        search_dir=str(paths["search_dir"]),
-        transcript_dir=str(paths["transcript_dir"]),
-        article_path=str(article_path),
-        run_id=run_id,
-        research_mode=resolved_mode,
-        research_plan_path=str(discovery_artifacts.get("research_plan", research_plan_path))
-        if discovery_artifacts or resolved_mode == "wide"
-        else None,
-        video_enrichment_manifest_path=str(
-            discovery_artifacts.get("video_enrichment_manifest", video_enrichment_manifest_path)
-        )
-        if discovery_artifacts or resolved_mode == "wide"
-        else None,
-        selection_manifest_path=str(discovery_artifacts.get("selection_manifest", selection_manifest_path))
-        if discovery_artifacts or resolved_mode == "wide"
-        else None,
-    )
     options = build_agent_options(project_root, model=model)
+    evidence_model = resolve_evidence_model(env_values, model)
+    evidence_options = build_agent_options(project_root, model=evidence_model)
+    prompt = (
+        build_query_planner_prompt(question=question, selection_manifest_path=selection_manifest_path)
+        if resolved_mode == "wide"
+        else build_prompt(
+            input_value=input_value,
+            question=question,
+            workspace_dir=str(paths["workspace_dir"]),
+            search_dir=str(paths["search_dir"]),
+            transcript_dir=str(paths["transcript_dir"]),
+            article_path=str(article_path),
+            run_id=run_id,
+            research_mode=resolved_mode,
+        )
+    )
 
     metadata = build_run_metadata(
         input_value=input_value,
@@ -1312,6 +2100,7 @@ async def run_agent(
                 **metadata,
                 "source_id": source_id,
                 "research_mode": resolved_mode,
+                "evidence_model": evidence_model,
                 "search_dir": str(paths["search_dir"]),
                 "transcript_dir": str(paths["transcript_dir"]),
                 "article_path": str(article_path),
@@ -1323,69 +2112,211 @@ async def run_agent(
         "research_plan_path": research_plan_path,
         "video_enrichment_manifest_path": video_enrichment_manifest_path,
         "selection_manifest_path": selection_manifest_path,
+        "evidence_manifest_path": evidence_manifest_path if resolved_mode == "wide" else None,
     }
 
-    stop_event = asyncio.Event()
-    artifact_watcher = asyncio.create_task(
-        _watch_artifact_progress(
-            transcript_dir=paths["transcript_dir"],
-            article_path=article_path,
-            progress_sink=progress_sink,
-            stop_event=stop_event,
+    if resolved_mode == "wide":
+        try:
+            query_plan = await plan_supplemental_queries(
+                question=question,
+                selection_manifest_path=selection_manifest_path,
+                query_plan_path=query_plan_path,
+                run_id=run_id,
+                options=options,
+                logger=logger,
+            )
+            await run_supplemental_searches(
+                query_plan=query_plan,
+                search_dir=paths["search_dir"],
+                run_id=run_id,
+                progress_sink=progress_sink,
+                logger=logger,
+            )
+            generate_transcript_fetch_plan_from_searches(
+                plan_path=transcript_fetch_plan_path,
+                search_dir=paths["search_dir"],
+                run_id=run_id,
+            )
+        except Exception as exc:
+            error_message = str(exc)
+            logger.exception(format_log_event("query_planning_failed", {"error_message": error_message}))
+            write_artifact_reports(
+                sources_manifest_path=sources_manifest_path,
+                article_manifest_path=article_manifest_path,
+                quality_report_path=quality_report_path,
+                search_dir=paths["search_dir"],
+                transcript_dir=paths["transcript_dir"],
+                article_path=article_path,
+                run_id=run_id,
+                research_mode=resolved_mode,
+                **discovery_report_paths,
+            )
+            write_run_manifest(
+                run_manifest_path,
+                status="failed",
+                input_value=input_value,
+                question=question,
+                source_id=source_id,
+                research_mode=resolved_mode,
+                model=model,
+                paths=paths,
+                article_path=article_path,
+                run_id=run_id,
+                error_message=error_message,
+                sources_manifest_path=sources_manifest_path,
+                article_manifest_path=article_manifest_path,
+                quality_report_path=quality_report_path,
+                **discovery_report_paths,
+            )
+            _emit_progress(progress_sink, "task_failed", "failed", "任务失败", data={"error_message": error_message})
+            raise AgentRunError(error_message) from exc
+    else:
+        stop_event = asyncio.Event()
+        artifact_watcher = asyncio.create_task(
+            _watch_artifact_progress(
+                transcript_dir=paths["transcript_dir"],
+                article_path=article_path,
+                progress_sink=progress_sink,
+                stop_event=stop_event,
+                start_article_on_transcript=True,
+            )
         )
-    )
-    sdk_error_message: str | None = None
-    try:
-        async for message in query(prompt=prompt, options=options):
-            sdk_error_message = _sdk_error_message(message) or sdk_error_message
-            logger.info(format_log_event("sdk_message", serialize_message(message)))
-            for text in _iter_text_blocks(message):
-                logger.info(format_log_text_block("message_text", text))
-                print(text)
-    except Exception as exc:
-        error_message = sdk_error_message or str(exc)
-        logger.exception(format_log_event("agent_failed", {"error_message": error_message}))
-        write_artifact_reports(
-            sources_manifest_path=sources_manifest_path,
-            article_manifest_path=article_manifest_path,
-            quality_report_path=quality_report_path,
-            search_dir=paths["search_dir"],
-            transcript_dir=paths["transcript_dir"],
-            article_path=article_path,
-            run_id=run_id,
-            research_mode=resolved_mode,
-            **discovery_report_paths,
-        )
-        write_run_manifest(
-            run_manifest_path,
-            status="failed",
-            input_value=input_value,
-            question=question,
-            source_id=source_id,
-            research_mode=resolved_mode,
-            model=model,
-            paths=paths,
-            article_path=article_path,
-            run_id=run_id,
-            error_message=error_message,
-            sources_manifest_path=sources_manifest_path,
-            article_manifest_path=article_manifest_path,
-            quality_report_path=quality_report_path,
-            **discovery_report_paths,
-        )
-        _emit_progress(progress_sink, "task_failed", "failed", "任务失败", data={"error_message": error_message})
-        raise AgentRunError(error_message) from exc
-    finally:
-        stop_event.set()
-        await artifact_watcher
+        sdk_error_message: str | None = None
+        try:
+            sdk_error_message = await _consume_sdk_query(prompt, options, logger, "sdk_message")
+        except Exception as exc:
+            error_message = sdk_error_message or str(exc)
+            logger.exception(format_log_event("agent_failed", {"error_message": error_message}))
+            write_artifact_reports(
+                sources_manifest_path=sources_manifest_path,
+                article_manifest_path=article_manifest_path,
+                quality_report_path=quality_report_path,
+                search_dir=paths["search_dir"],
+                transcript_dir=paths["transcript_dir"],
+                article_path=article_path,
+                run_id=run_id,
+                research_mode=resolved_mode,
+                **discovery_report_paths,
+            )
+            write_run_manifest(
+                run_manifest_path,
+                status="failed",
+                input_value=input_value,
+                question=question,
+                source_id=source_id,
+                research_mode=resolved_mode,
+                model=model,
+                paths=paths,
+                article_path=article_path,
+                run_id=run_id,
+                error_message=error_message,
+                sources_manifest_path=sources_manifest_path,
+                article_manifest_path=article_manifest_path,
+                quality_report_path=quality_report_path,
+                **discovery_report_paths,
+            )
+            _emit_progress(progress_sink, "task_failed", "failed", "任务失败", data={"error_message": error_message})
+            raise AgentRunError(error_message) from exc
+        finally:
+            stop_event.set()
+            await artifact_watcher
+
+    if resolved_mode == "wide":
+        try:
+            await fetch_wide_transcripts_from_plan(
+                plan_path=transcript_fetch_plan_path,
+                selection_manifest_path=selection_manifest_path,
+                transcript_dir=paths["transcript_dir"],
+                manifest_path=transcript_fetch_manifest_path,
+                run_id=run_id,
+                progress_sink=progress_sink,
+                logger=logger,
+            )
+            write_sources_manifest(
+                sources_manifest_path,
+                search_dir=paths["search_dir"],
+                transcript_dir=paths["transcript_dir"],
+                article_path=article_path,
+                run_id=run_id,
+            )
+            extract_evidence_manifest = await extract_evidence_cards(
+                question=question,
+                transcript_dir=paths["transcript_dir"],
+                evidence_dir=paths["evidence_dir"],
+                evidence_manifest_path=evidence_manifest_path,
+                run_id=run_id,
+                options=evidence_options,
+                logger=logger,
+                progress_sink=progress_sink,
+            )
+            _emit_progress(
+                progress_sink,
+                "phase_started",
+                "article_write",
+                "正在撰写深度文章",
+                data={
+                    "article_path": str(article_path),
+                    "evidence_manifest_path": str(evidence_manifest_path),
+                    "evidence_success_count": extract_evidence_manifest.get("success_count"),
+                },
+            )
+            final_prompt = build_wide_article_prompt(
+                question=question,
+                evidence_manifest_path=evidence_manifest_path,
+                article_path=article_path,
+                sources_manifest_path=sources_manifest_path,
+            )
+            logger.info(format_log_event("wide_article_prompt_ready", {"prompt_chars": len(final_prompt)}))
+            await _consume_sdk_query(final_prompt, options, logger, "sdk_message")
+        except Exception as exc:
+            error_message = str(exc)
+            logger.exception(format_log_event("evidence_or_wide_article_failed", {"error_message": error_message}))
+            write_artifact_reports(
+                sources_manifest_path=sources_manifest_path,
+                article_manifest_path=article_manifest_path,
+                quality_report_path=quality_report_path,
+                search_dir=paths["search_dir"],
+                transcript_dir=paths["transcript_dir"],
+                article_path=article_path,
+                run_id=run_id,
+                research_mode=resolved_mode,
+                **discovery_report_paths,
+            )
+            write_run_manifest(
+                run_manifest_path,
+                status="failed",
+                input_value=input_value,
+                question=question,
+                source_id=source_id,
+                research_mode=resolved_mode,
+                model=model,
+                paths=paths,
+                article_path=article_path,
+                run_id=run_id,
+                error_message=error_message,
+                sources_manifest_path=sources_manifest_path,
+                article_manifest_path=article_manifest_path,
+                quality_report_path=quality_report_path,
+                **discovery_report_paths,
+            )
+            _emit_progress(progress_sink, "task_failed", "failed", "任务失败", data={"error_message": error_message})
+            raise AgentRunError(error_message) from exc
 
     transcript_path = find_transcript_context(paths["transcript_dir"])
     if transcript_path is not None and (not article_path.exists() or article_path.stat().st_size == 0):
-        retry_prompt = build_article_retry_prompt(
-            transcript_path=transcript_path,
-            article_path=article_path,
-            question=question,
-        )
+        if resolved_mode == "wide" and evidence_manifest_path.exists():
+            retry_prompt = build_wide_article_prompt(
+                question=question,
+                evidence_manifest_path=evidence_manifest_path,
+                article_path=article_path,
+                sources_manifest_path=sources_manifest_path,
+            )
+        else:
+            retry_prompt = build_article_retry_prompt(
+                transcript_path=transcript_path,
+                article_path=article_path,
+                question=question,
+            )
         logger.info(
             format_log_event(
                 "article_retry_started",
@@ -1394,12 +2325,7 @@ async def run_agent(
         )
         retry_sdk_error_message: str | None = None
         try:
-            async for message in query(prompt=retry_prompt, options=options):
-                retry_sdk_error_message = _sdk_error_message(message) or retry_sdk_error_message
-                logger.info(format_log_event("sdk_message", serialize_message(message)))
-                for text in _iter_text_blocks(message):
-                    logger.info(format_log_text_block("message_text", text))
-                    print(text)
+            retry_sdk_error_message = await _consume_sdk_query(retry_prompt, options, logger, "sdk_message")
         except Exception as exc:
             error_message = retry_sdk_error_message or str(exc)
             logger.exception(format_log_event("article_retry_failed", {"error_message": error_message}))

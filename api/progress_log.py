@@ -12,6 +12,7 @@ ProgressEvent = dict[str, object]
 PROGRESS_PHASE_MESSAGES = {
     "prepare": "任务准备中",
     "source_fetch": "正在获取视频转录上下文",
+    "evidence_extract": "正在提取核心证据卡片",
     "article_write": "正在撰写深度文章",
     "completed": "深度文章生成完成",
     "failed": "任务失败",
@@ -76,4 +77,3 @@ class ProgressLog:
             event: dict[str, Any] = json.loads(line)
             max_seq = max(max_seq, int(event.get("seq", 0)))
         return max_seq + 1
-

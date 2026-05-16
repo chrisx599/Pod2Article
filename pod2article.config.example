@@ -5,3 +5,7 @@
 # 3. local .env
 
 SERPAPI_API_KEY=your-serpapi-api-key
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+ANTHROPIC_API_KEY=your-deepseek-api-key
+CLAUDE_AGENT_MODEL=deepseek-v4-pro
+EVIDENCE_AGENT_MODEL=deepseek-v4-flash

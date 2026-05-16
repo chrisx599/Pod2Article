@@ -15,21 +15,26 @@ from agents.podcast_article_agent import (
     DEFAULT_OUTPUT_DIR,
     build_agent_options,
     build_article_dir,
+    build_evidence_prompt,
     build_prompt,
+    build_query_planner_prompt,
     build_run_metadata,
     build_source_id,
     build_workspace_paths,
+    build_wide_article_prompt,
     default_log_path,
     extract_youtube_video_id,
     find_transcript_context,
     load_env_file,
     normalize_youtube_timestamp_link_text,
+    resolve_evidence_model,
     resolve_model,
     run_agent,
     serialize_message,
     should_prepare_discovery,
     _sdk_error_message,
     write_run_manifest,
+    write_evidence_manifest,
     write_sources_manifest,
 )
 from agents.log_format import sanitize_for_log
@@ -93,16 +98,39 @@ class PodcastArticleAgentTests(unittest.TestCase):
             research_mode="wide",
         )
 
-        self.assertIn("Required adaptive wide-search workflow", prompt)
-        self.assertIn("There is no fixed transcript count target", prompt)
-        self.assertIn('fetch_transcript.py "<selected-video-url>"', prompt)
-        self.assertIn("--run-id article-20260510T123000Z-abcdef12", prompt)
-        self.assertIn("Enforce source diversity", prompt)
-        self.assertIn("Use third-party analysis only as background context", prompt)
-        self.assertIn("Do not let one long transcript dominate", prompt)
-        self.assertIn("Open the prebuilt discovery artifacts", prompt)
-        self.assertIn("search_queries: <prebuilt and supplemental search queries used>", prompt)
+        self.assertIn("Plan only supplemental YouTube search queries", prompt)
+        self.assertIn("Do not run Bash, Read, Write", prompt)
+        self.assertIn("article-20260510T123000Z-abcdef12", prompt)
+        self.assertIn("supplemental_queries", prompt)
+        self.assertIn("The Python runner, not you, will write the transcript fetch plan", prompt)
+        self.assertIn("transcript-fetch-plan.json", prompt)
+        self.assertNotIn("Write a coherent Markdown article", prompt)
         self.assertNotIn(f"search_youtube.py {shlex.quote(question)}", prompt)
+
+    def test_query_planner_prompt_includes_candidate_summary_without_tool_use(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            selection_path = Path(tmpdir) / "selection-manifest.json"
+            selection_path.write_text(
+                json.dumps(
+                    {
+                        "selected_candidates": [
+                            {
+                                "video_id": "abc12345678",
+                                "title": "AI leader interview",
+                                "channel": "Demo",
+                                "published_date": "1 month ago",
+                                "score": 9.5,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            prompt = build_query_planner_prompt(question="调研 AI", selection_manifest_path=selection_path)
+
+        self.assertIn("AI leader interview", prompt)
+        self.assertIn("Return only compact JSON", prompt)
+        self.assertIn("Do not use tools", prompt)
 
     def test_should_prepare_discovery_for_wide_or_search_query_deep(self) -> None:
         self.assertTrue(should_prepare_discovery("ai founder interviews", "deep"))
@@ -143,6 +171,7 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(paths["workspace_dir"], Path("output/agent/hmtuvNfytjM"))
         self.assertEqual(paths["search_dir"], Path("output/agent/hmtuvNfytjM/search-results"))
         self.assertEqual(paths["transcript_dir"], Path("output/agent/hmtuvNfytjM/transcripts"))
+        self.assertEqual(paths["evidence_dir"], Path("output/agent/hmtuvNfytjM/evidence"))
         self.assertEqual(paths["articles_root"], Path("output/agent/hmtuvNfytjM/articles"))
 
     def test_load_env_file_and_resolve_model(self) -> None:
@@ -157,13 +186,20 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertEqual(values["DEFAULT_MODEL"], "base")
         self.assertEqual(resolved, "override")
 
+    def test_resolve_evidence_model_uses_specific_override(self) -> None:
+        with patch.dict("os.environ", {"EVIDENCE_AGENT_MODEL": "deepseek-v4-flash"}, clear=True):
+            self.assertEqual(resolve_evidence_model({}, "deepseek-v4-pro"), "deepseek-v4-flash")
+
+        self.assertEqual(resolve_evidence_model({}, "deepseek-v4-pro"), "deepseek-v4-pro")
+
     def test_load_env_file_overrides_existing_environment(self) -> None:
         with TemporaryDirectory() as tmpdir:
             env_path = Path(tmpdir) / ".env"
             env_path.write_text(
                 "ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic\n"
                 "ANTHROPIC_API_KEY=deepseek-key\n"
-                "CLAUDE_AGENT_MODEL=deepseek-v4-pro\n",
+                "CLAUDE_AGENT_MODEL=deepseek-v4-pro\n"
+                "EVIDENCE_AGENT_MODEL=deepseek-v4-flash\n",
                 encoding="utf-8",
             )
 
@@ -181,6 +217,7 @@ class PodcastArticleAgentTests(unittest.TestCase):
 
                 self.assertEqual(os.environ["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
                 self.assertEqual(os.environ["ANTHROPIC_API_KEY"], "deepseek-key")
+                self.assertEqual(os.environ["EVIDENCE_AGENT_MODEL"], "deepseek-v4-flash")
                 self.assertNotIn("ANTHROPIC_AUTH_TOKEN", os.environ)
                 self.assertEqual(resolved, "deepseek-v4-pro")
 
@@ -248,6 +285,50 @@ class PodcastArticleAgentTests(unittest.TestCase):
         message = FakeResultMessage()
 
         self.assertEqual(_sdk_error_message(message), "API Error 402: Insufficient Balance")
+
+    def test_build_evidence_and_wide_article_prompts_use_compact_cards(self) -> None:
+        evidence_prompt = build_evidence_prompt(
+            question="调研 AI 行业判断",
+            transcript_path=Path("output/run/transcripts/demo.transcript.json"),
+            evidence_path=Path("output/run/evidence/demo.evidence.json"),
+        )
+        article_prompt = build_wide_article_prompt(
+            question="调研 AI 行业判断",
+            evidence_manifest_path=Path("output/run/evidence/evidence-manifest.json"),
+            article_path=Path("output/run/articles/article.md"),
+            sources_manifest_path=Path("output/run/sources-manifest.json"),
+        )
+
+        self.assertIn("Extract compact, question-focused evidence cards", evidence_prompt)
+        self.assertIn('"cards"', evidence_prompt)
+        self.assertIn("Write one JSON object only to this exact path", evidence_prompt)
+        self.assertIn("Read this evidence manifest first", article_prompt)
+        self.assertIn("Use the evidence cards as the primary context", article_prompt)
+        self.assertIn("(罗福莉谈框架自进化 [00:55:33]", article_prompt)
+
+    def test_write_evidence_manifest_records_partial_failures(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            transcript = root / "demo.transcript.json"
+            transcript.write_text("{}", encoding="utf-8")
+
+            manifest = write_evidence_manifest(
+                root / "evidence-manifest.json",
+                run_id="run-1",
+                transcript_paths=[transcript],
+                successes=[
+                    {
+                        "video_id": "hmtuvNfytjM",
+                        "path": str(root / "hmtuvNfytjM.evidence.json"),
+                        "card_count": 3,
+                    }
+                ],
+                failures=[{"video_id": "failed12345", "error_message": "boom"}],
+            )
+
+        self.assertEqual(manifest["transcript_count"], 1)
+        self.assertEqual(manifest["success_count"], 1)
+        self.assertEqual(manifest["failed_count"], 1)
 
     def test_log_sanitizer_preserves_usage_token_counts(self) -> None:
         payload = sanitize_for_log(
@@ -475,6 +556,195 @@ class PodcastArticleAgentTests(unittest.TestCase):
         self.assertIn("[00:00:00]", article_text)
         phases = [event["phase"] for event in events]
         self.assertIn("source_fetch", phases)
+        self.assertIn("article_write", phases)
+
+    def test_run_agent_wide_extracts_evidence_before_article_write(self) -> None:
+        events: list[dict[str, object]] = []
+        prompts: list[str] = []
+
+        def fake_prepare_discovery(
+            *,
+            input_value: str,
+            question: str,
+            research_mode: str,
+            workspace_dir: Path,
+            search_dir: Path,
+            run_id: str,
+        ) -> dict[str, Path]:
+            search_dir.mkdir(parents=True, exist_ok=True)
+            for index in range(2):
+                (search_dir / f"demo-{index}.search.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": run_id,
+                            "query": f"demo {index}",
+                            "candidates": [
+                                {
+                                    "video_id": f"widevideo0{index}",
+                                    "title": f"Demo {index}",
+                                    "score": 1.0,
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            research_plan = workspace_dir / "research-plan.json"
+            video_enrichment = workspace_dir / "video-enrichment-manifest.json"
+            selection = workspace_dir / "selection-manifest.json"
+            research_plan.write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
+            video_enrichment.write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
+            selection.write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "candidate_count": 2,
+                        "search_round_count": 1,
+                        "selected_candidates": [
+                            {
+                                "video_id": f"widevideo0{index}",
+                                "title": f"Demo {index}",
+                                "channel": "Demo Channel",
+                                "url": f"https://www.youtube.com/watch?v=widevideo0{index}",
+                                "score": 10 - index,
+                            }
+                            for index in range(2)
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "research_plan": research_plan,
+                "video_enrichment_manifest": video_enrichment,
+                "selection_manifest": selection,
+            }
+
+        async def fake_query(prompt: str, options: object):
+            prompts.append(prompt)
+            if "Plan only supplemental YouTube search queries" in prompt:
+                await asyncio.sleep(0)
+                yield FakeResultMessage(
+                    is_error=False,
+                    api_error_status=None,
+                    result=json.dumps({"schema_version": 1, "supplemental_queries": []}),
+                )
+                return
+            elif "Extract compact, question-focused evidence cards" in prompt:
+                evidence_path = Path(prompt.split("Write one JSON object only to this exact path:")[1].splitlines()[1])
+                transcript_path = Path(prompt.split("Read this transcript JSON:")[1].splitlines()[1])
+                transcript_payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+                video = transcript_payload["video"]
+                start_sec = transcript_payload["segments"][0]["start_sec"]
+                evidence_path.parent.mkdir(parents=True, exist_ok=True)
+                evidence_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "video_id": video["video_id"],
+                            "title": video["title"],
+                            "channel": video["channel"],
+                            "source_kind": "transcript",
+                            "transcript_path": str(transcript_path),
+                            "relevance": "high",
+                            "coverage_note": "完整",
+                            "excluded": False,
+                            "exclusion_reason": "",
+                            "cards": [
+                                {
+                                    "claim": "核心观点",
+                                    "why_it_matters": "回答问题",
+                                    "timestamp": "00:00:00",
+                                    "start_sec": start_sec,
+                                    "url": f"https://www.youtube.com/watch?v={video['video_id']}&t={start_sec}s",
+                                    "quote_or_paraphrase": "核心观点",
+                                    "source_cue": "Demo观点",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            elif "Write the final grounded wide video deep research article" in prompt:
+                article_path = Path(prompt.split("Write the final Markdown article only to this exact path:")[1].splitlines()[1])
+                article_path.parent.mkdir(parents=True, exist_ok=True)
+                article_path.write_text(
+                    "# Wide Demo\n\n行业判断来自多条证据。(Demo观点 [00:00:00](https://www.youtube.com/watch?v=widevideo00&t=0s))\n",
+                    encoding="utf-8",
+                )
+            await asyncio.sleep(0)
+            yield object()
+
+        def fake_fetch_transcript_context(raw_input: str, *, output_dir: Path, run_id: str, **kwargs: object) -> Path:
+            video_id = raw_input.rsplit("=", 1)[-1]
+            index = int(video_id[-1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            transcript_path = output_dir / f"demo-{index}.transcript.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "video": {
+                            "video_id": video_id,
+                            "title": f"Demo {index}",
+                            "channel": "Demo Channel",
+                            "url": f"https://www.youtube.com/watch?v={video_id}",
+                        },
+                        "source_kind": "transcript",
+                        "coverage": {"segments_count": 1},
+                        "segments": [
+                            {
+                                "start_sec": index * 60,
+                                "timestamp": f"00:0{index}:00",
+                                "url": f"https://www.youtube.com/watch?v={video_id}&t={index * 60}s",
+                                "text": "核心观点",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return transcript_path
+
+        with patch("agents.podcast_article_agent.query", fake_query):
+            with patch("agents.podcast_article_agent.ResultMessage", FakeResultMessage):
+                with patch("agents.podcast_article_agent.prepare_research_discovery", fake_prepare_discovery):
+                    with patch("agents.podcast_article_agent.fetch_transcript_context", fake_fetch_transcript_context):
+                        with patch("agents.podcast_article_agent.ARTIFACT_PROGRESS_POLL_SECONDS", 0.01):
+                            with TemporaryDirectory() as tmpdir:
+                                article_path = asyncio.run(
+                                    run_agent(
+                                        input_value="调研 AI 行业判断",
+                                        question="调研 AI 行业判断",
+                                        output_dir=tmpdir,
+                                        log_path=Path(tmpdir) / "agent.log",
+                                        progress_sink=events.append,
+                                    )
+                                )
+                                workspace_dir = article_path.parents[2]
+                                run_manifest = json.loads((workspace_dir / "run-manifest.json").read_text(encoding="utf-8"))
+                                query_plan = json.loads((workspace_dir / "query-plan.json").read_text(encoding="utf-8"))
+                                fetch_manifest = json.loads(
+                                    (workspace_dir / "transcript-fetch-manifest.json").read_text(encoding="utf-8")
+                                )
+                                evidence_manifest = json.loads(
+                                    (workspace_dir / "evidence" / "evidence-manifest.json").read_text(encoding="utf-8")
+                                )
+                                quality_report = json.loads((workspace_dir / "quality-report.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(any("Plan only supplemental YouTube search queries" in prompt for prompt in prompts))
+        self.assertEqual(len([prompt for prompt in prompts if "Extract compact, question-focused evidence cards" in prompt]), 2)
+        self.assertTrue(any("Write the final grounded wide video deep research article" in prompt for prompt in prompts))
+        self.assertEqual(query_plan["supplemental_queries"], [])
+        self.assertEqual(evidence_manifest["success_count"], 2)
+        self.assertEqual(fetch_manifest["success_count"], 2)
+        self.assertEqual(evidence_manifest["failed_count"], 0)
+        self.assertEqual(run_manifest["artifacts"]["query_plan"], str(workspace_dir / "query-plan.json"))
+        self.assertEqual(run_manifest["artifacts"]["transcript_fetch_manifest"], str(workspace_dir / "transcript-fetch-manifest.json"))
+        self.assertEqual(run_manifest["artifacts"]["evidence_manifest"], str(workspace_dir / "evidence" / "evidence-manifest.json"))
+        self.assertEqual(quality_report["evidence_success_count"], 2)
+        phases = [event["phase"] for event in events]
+        self.assertIn("evidence_extract", phases)
         self.assertIn("article_write", phases)
 
 
